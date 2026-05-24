@@ -1,0 +1,56 @@
+name: Build Magisk Module
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      NDK_VERSION: "27.2.12479018"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Android NDK
+        shell: bash
+        run: |
+          yes | "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" "ndk;${NDK_VERSION}"
+          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Build native artifacts
+        shell: bash
+        run: bash scripts/build-native.sh
+
+      - name: Set package name
+        shell: bash
+        run: |
+          build_time="$(TZ=Asia/Shanghai date +'%Y%m%d-%H%M%S')"
+          echo "BUILD_TIME=${build_time}" >> "$GITHUB_ENV"
+          echo "ZIP_NAME=scene-netns-isolator-${build_time}.zip" >> "$GITHUB_ENV"
+
+      - name: Package module zip
+        shell: bash
+        run: |
+          rm -f "${ZIP_NAME}"
+          (cd module && zip -r "../${ZIP_NAME}" .)
+          unzip -l "${ZIP_NAME}"
+
+      - name: Publish GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v0.1.0-${BUILD_TIME}"
+          gh release create "${tag}" "${ZIP_NAME}" \
+            --title "Scene Netns Isolator v0.1.0 (${BUILD_TIME} GMT+8)" \
+            --notes "Automated release from ${GITHUB_SHA}." \
+            --latest=false

@@ -1,0 +1,6 @@
+id=scene-netns-isolator
+name=Scene Netns Isolator
+version=0.1.0
+versionCode=1
+author=natum
+description=Isolate Scene 4 app and daemon into a shared private network namespace.

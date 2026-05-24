@@ -1,0 +1,5 @@
+build/
+scene-netns-isolator*.zip
+module/bin/scene-netnsctl
+module/bin/su
+module/zygisk/*.so
