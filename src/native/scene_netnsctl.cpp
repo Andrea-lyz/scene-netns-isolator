@@ -648,9 +648,16 @@ bool write_proc_file(const char *path, const char *value) {
       // Pattern: "default via <gw> dev <oif> ..."
       if (toks.size() >= 5 && toks[0] == "default" && toks[1] == "via" &&
           toks[3] == "dev") {
+        const std::string &gw = toks[2];
         const std::string &oif = toks[4];
         if (oif == "dummy0" || oif == "lo") continue;
-        upstream_gw = toks[2];
+        // Skip link-local IPv6 gateways: they're not reachable for the v4
+        // traffic that scene-isolator forwards, and the kernel-installed
+        // RA-based defaults are usually replaced moments later by the real
+        // v4 DHCP/PPP default.  Selecting a link-local v6 gateway here
+        // would briefly poison table 99 with an unusable default.
+        if (gw.compare(0, 4, "fe80") == 0 || gw.find(':') != std::string::npos) continue;
+        upstream_gw = gw;
         upstream_oif = oif;
         break;
       }
