@@ -95,7 +95,7 @@ Android 把 default 路由分散在每张网卡的私有路由表里（`wlan0`�
 | OnePlus 13 / ColorOS 16 + KernelSU + ZygiskNext | ✅ 已验证 | 主测设备，Scene 完整登录、内购可用 |
 | AOSP / Pixel | 🟢 高置信 | 无 OEM 自定义路由策略，理论最干净 |
 | 三星 One UI | 🟡 应该可用 | 接近 AOSP，未实测 |
-| 小米 HyperOS / MIUI | ⚠️ 部分功能受影响 | Scene 本身可用，但反馈设备互联 / 小米互传 / 共享桌面会失败。详见下方副作用说明 |
+| 小米 HyperOS / MIUI | 🟡 v1.1.0 后应可用 | v1.0.0 有副作用（见下方），v1.1.0 已改用接口级 forwarding |
 | vivo OriginOS / iQOO | 🟡 应该可用 | 未实测 |
 | 老 EMUI / Magic UI | 🟡 应该可用 | 仍是 Linux 内核，未实测 |
 | HarmonyOS NEXT | ❌ 不工作 | 鸿蒙微内核，没有 Linux netns |
@@ -234,16 +234,13 @@ ss -ltnp | grep -E ":8788|:8765|:14754"
 
 ### 小米 HyperOS / MIUI 的副作用
 
-已知会**影响以下系统功能**，原因是模块在 host netns 全局开启了 `net.ipv4.ip_forward = 1`，
-小米 ROM 的网络优化模块（`MIUI NetworkBoost` 等）对此变化敏感：
+v1.0.0 会在 host netns 全局开启 `net.ipv4.ip_forward = 1`，小米 ROM 的网络优化模块对此敏感，导致：
 
 - 设备互联（Mi Smart Hub）连不上
 - 小米互传文件失败
 - 共享桌面 / 多屏协同连接失败
 
-Scene 本身的功能不受影响。如果你重度使用上述功能，请暂时不要安装本模块，或仅在需要 Scene 时短期启用。
-
-后续版本计划改用接口级 `conf/<iface>/forwarding` 替代全局开关，理论上能消除这一影响。
+**v1.1.0 已修复**：改用接口级 `conf/scn-h/forwarding` + `conf/<upstream>/forwarding`，不再触碰全局开关。如果你的设备仍有问题，请提 issue 附 `cat /proc/sys/net/ipv4/ip_forward` 和 pinner.log。
 
 ---
 

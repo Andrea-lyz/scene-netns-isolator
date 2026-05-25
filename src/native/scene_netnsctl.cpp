@@ -561,8 +561,38 @@ bool write_proc_file(const char *path, const char *value) {
   Cmd c_up = {ip_bin, "link", "set", kVethHost, "up"};
   if (run_capture(ip_bin, c_up.argv(), "veth-host") != 0) _exit(8);
 
-  // Enable forwarding in host netns (per-netns sysctl).
-  if (!write_proc_file("/proc/sys/net/ipv4/ip_forward", "1\n")) _exit(9);
+  // Enable forwarding ONLY on the interfaces we use, without touching the
+  // global ip_forward switch.  Writing to /proc/sys/net/ipv4/ip_forward (or
+  // equivalently conf/all/forwarding) triggers OEM network modules on Xiaomi
+  // HyperOS/MIUI to enter "router mode", breaking Wi-Fi Direct, Mi Share,
+  // device interconnect, and screencast.
+  //
+  // Per-interface forwarding is sufficient: the kernel forwards a packet if
+  // BOTH the ingress and egress interface have forwarding=1, regardless of
+  // the global switch.  We enable it on scn-h (our veth host end) and on
+  // all physical upstreams we might use.  The routing watchdog will also
+  // enable it on whichever oif it selects later.
+  write_proc_file("/proc/sys/net/ipv4/conf/scn-h/forwarding", "1\n");
+  // Also enable on "all" only if it's already 1 (some ROMs pre-set it for
+  // tethering).  If it's 0 we leave it alone.
+  {
+    char cur[4] = {};
+    int fd_chk = open("/proc/sys/net/ipv4/ip_forward", O_RDONLY | O_CLOEXEC);
+    if (fd_chk >= 0) {
+      read(fd_chk, cur, sizeof(cur) - 1);
+      close(fd_chk);
+    }
+    if (cur[0] != '1') {
+      // Global forwarding is off.  We do NOT flip it.  Instead we rely on
+      // per-interface forwarding which the kernel honours independently.
+      // Note: on kernels where per-interface forwarding alone is not enough
+      // (very old 3.x), this will silently fail to forward.  All modern
+      // Android kernels (4.9+) support per-interface forwarding correctly.
+      log_line("scene-netnsctl: [veth-host] ip_forward is off; using per-iface forwarding only");
+    } else {
+      log_line("scene-netnsctl: [veth-host] ip_forward already on (tethering?); leaving as-is");
+    }
+  }
 
   // NAT + forward rules.  We use -I (insert at top) for FORWARD so that any
   // OEM-supplied DROP/REJECT rules later in the chain don't shadow ours.
@@ -796,6 +826,16 @@ bool write_proc_file(const char *path, const char *value) {
   if (cf >= 0) {
     write(cf, desired.c_str(), desired.size());
     close(cf);
+  }
+
+  // Enable per-interface forwarding on the chosen upstream so the kernel
+  // actually forwards packets out of it (without touching the global switch).
+  {
+    char fwd_path[128];
+    std::snprintf(fwd_path, sizeof(fwd_path),
+                  "/proc/sys/net/ipv4/conf/%s/forwarding",
+                  upstream_oif.c_str());
+    write_proc_file(fwd_path, "1\n");
   }
 
   log_line("scene-netnsctl: [route-refresh] table 99 ready (default via %s dev %s)",
