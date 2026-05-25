@@ -110,7 +110,7 @@ to detect.
 | OnePlus 13 / ColorOS 16 + KernelSU + ZygiskNext | ✅ Verified | Reference device. Full Scene login + in-app billing works. |
 | AOSP / Pixel | 🟢 High confidence | No OEM-specific routing quirks expected. |
 | Samsung One UI | 🟡 Should work | AOSP-derived. Untested. |
-| Xiaomi HyperOS / MIUI | 🟡 Should work | Same kernel capabilities. Untested. |
+| Xiaomi HyperOS / MIUI | ⚠️ Partial side effects | Scene itself works, but Mi Smart Hub / Mi Share / screencast may fail. See limitations below. |
 | vivo OriginOS / iQOO | 🟡 Should work | Untested. |
 | Older EMUI / Magic UI | 🟡 Should work | Still Linux kernel. Untested. |
 | HarmonyOS NEXT | ❌ Won't work | Microkernel; no Linux netns. |
@@ -258,6 +258,23 @@ The pinner writes everything to **`/dev/.15f1c4b9/pinner.log`**.
 - Aggressive anti-root environments will still notice Zygisk and the custom
   veth interface, but that is orthogonal to this module's threat model
   (preventing other apps from probing Scene's ports).
+
+### Xiaomi HyperOS / MIUI side effects
+
+The module currently sets `net.ipv4.ip_forward = 1` globally in the host
+netns. Xiaomi's network optimisation modules (`MIUI NetworkBoost` and
+similar) are sensitive to this and the following system features have been
+reported broken on HyperOS:
+
+- Mi Smart Hub device interconnect
+- Mi Share file transfer
+- Screencast / multi-screen collaboration
+
+Scene itself still works. If you rely on the features above, hold off on
+installing this module, or enable it only during Scene sessions.
+
+A future release plans to replace the global toggle with per-interface
+`conf/<iface>/forwarding`, which should eliminate this side effect.
 
 ---
 
