@@ -713,7 +713,12 @@ bool write_proc_file(const char *path, const char *value) {
   }
 
   // Read previously-applied upstream from cache, skip if unchanged so we
-  // don't churn the routing table on every poll.
+  // don't churn the routing table on every poll.  But: an oif that
+  // momentarily disappeared (wifi off then back on) and reappeared with
+  // the same gw/oif still requires us to re-install the route, because
+  // the kernel removes our table 99 entry when its underlying device
+  // goes down.  So before short-circuiting, verify table 99 actually
+  // still has a default that matches.
   char prev[256] = {};
   int cf = open(kUpstreamCachePath, O_RDONLY | O_CLOEXEC);
   if (cf >= 0) {
@@ -723,7 +728,39 @@ bool write_proc_file(const char *path, const char *value) {
   }
   std::string desired = upstream_gw + " " + upstream_oif + "\n";
   if (std::strcmp(prev, desired.c_str()) == 0) {
-    _exit(0);  // already up to date
+    // Cache hit -- but only trust it if table 99 currently has a usable
+    // default with the right gw/oif.  Otherwise fall through and rebuild.
+    std::string t99;
+    int pipefd[2];
+    if (pipe(pipefd) == 0) {
+      pid_t p = fork();
+      if (p == 0) {
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[0]);
+        close(pipefd[1]);
+        const char *argv[] = {ip_bin, "route", "show", "table", "99",
+                              "default", nullptr};
+        execv(ip_bin, const_cast<char *const *>(argv));
+        _exit(127);
+      }
+      close(pipefd[1]);
+      char buf[256];
+      ssize_t n;
+      while ((n = read(pipefd[0], buf, sizeof(buf))) > 0)
+        t99.append(buf, n);
+      close(pipefd[0]);
+      int st = 0;
+      waitpid(p, &st, 0);
+    }
+    // Match if we see "via <gw>" and "dev <oif>".
+    bool t99_good =
+        t99.find(std::string("via ") + upstream_gw) != std::string::npos &&
+        t99.find(std::string("dev ") + upstream_oif) != std::string::npos;
+    if (t99_good) {
+      _exit(0);  // already up to date
+    }
+    // Otherwise fall through and rebuild the table.
   }
 
   log_line("scene-netnsctl: [route-refresh] upstream gw=%s oif=%s",
