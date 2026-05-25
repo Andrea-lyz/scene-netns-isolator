@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <linux/if.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <sched.h>
 #include <string>
 #include <sys/ioctl.h>
@@ -43,6 +44,7 @@ constexpr const char *kVethNetCidr   = "10.99.99.0/30";
 constexpr const char *kVethHostCidr  = "10.99.99.1/30";
 constexpr const char *kVethIsoCidr   = "10.99.99.2/30";
 constexpr const char *kVethGateway   = "10.99.99.1";
+constexpr const char *kUpstreamCachePath = "/dev/.15f1c4b9/.upstream";
 
 char g_sock_path[kUnixPathMax] = {};
 int g_host_ns_fd = -1;
@@ -354,6 +356,7 @@ void cleanup_stale_endpoint() {
   if (read_endpoint_path(stale_path, sizeof(stale_path), true)) unlink(stale_path);
   unlink(kEndpointPath);
   unlink(kPidPath);
+  unlink(kUpstreamCachePath);
 }
 
 // ---------------------------------------------------------------------------
@@ -480,6 +483,14 @@ bool write_proc_file(const char *path, const char *value) {
 }
 
 // Helper child entry: switch to host netns, set up veth + NAT, then exit.
+//
+// This stage 1 helper does the things that don't depend on the device having
+// finished bringing up its upstream network (wifi/mobile data).  It creates
+// the veth pair, addresses scn-h, enables ip_forward, and installs the
+// iptables MASQUERADE / FORWARD rules.  It deliberately does NOT touch the
+// policy routing rule + table 99: that part requires us to know the upstream
+// gateway, which on early boot may not exist yet.  We retry that step lazily
+// from a watchdog thread once the device has a default route.
 [[noreturn]] void host_setup_child(pid_t parent_pid_in_isolated) {
   // Switch this child process into the host netns.
   if (sys_setns(g_host_ns_fd, CLONE_NEWNET) != 0) {
@@ -514,6 +525,15 @@ bool write_proc_file(const char *path, const char *value) {
   Cmd c_fwd_out_del = {iptables_bin, "-D", "FORWARD",
                        "-o", kVethHost, "-j", "ACCEPT"};
   run_capture(iptables_bin, c_fwd_out_del.argv(), "veth-host-cleanup");
+  // Drop any rule we may have left pointing at table 99 from a prior run;
+  // the routing watchdog will recreate it once it knows the new upstream.
+  for (int i = 0; i < 4; ++i) {
+    Cmd c_rule_del = {ip_bin, "rule", "del", "iif", kVethHost,
+                      "table", "99"};
+    if (run_capture(ip_bin, c_rule_del.argv(), "veth-host-cleanup") != 0) break;
+  }
+  Cmd c_table_flush = {ip_bin, "route", "flush", "table", "99"};
+  run_capture(ip_bin, c_table_flush.argv(), "veth-host-cleanup");
 
   // Create veth pair.  Both ends start in host netns.
   Cmd c_link_add = {ip_bin, "link", "add", kVethHost,
@@ -548,70 +568,67 @@ bool write_proc_file(const char *path, const char *value) {
                    "-o", kVethHost, "-j", "ACCEPT"};
   if (run_capture(iptables_bin, c_fwd_out.argv(), "veth-host") != 0) _exit(12);
 
-  // Android does not put a default route in the main routing table; instead
-  // each network has its own per-network table selected by uid/mark/oif
-  // policy rules set up by netd.  When forwarded packets enter the host from
-  // scn-h they have no fwmark and no matching uid, so the kernel cannot find
-  // any default route and silently drops them BEFORE FORWARD ever runs.
-  //
-  // Build a private routing table that mirrors whichever default network the
-  // device currently uses, then add an `iif scn-h` rule that selects it.
-  // A reasonable preference (11000) puts us before the main lookup but after
-  // netd's per-network rules so we don't disturb anything else.
-  //
-  // We discover the default upstream by inspecting `ip route show table all
-  // default` and taking the first entry's gateway and oif.  This is the same
-  // approach Android's own ConnectivityService uses internally and survives
-  // wifi/mobile data switching well enough for the pinner's lifetime; if the
-  // user roams onto a different network the proxy keeps using the original
-  // upstream until pinner is restarted.
-  auto run_capture_text = [](const char *bin, std::vector<const char *> argv,
-                              std::string *out) -> int {
-    argv.push_back(nullptr);
-    int pipefd[2] = {-1, -1};
-    if (pipe(pipefd) != 0) return -1;
-    pid_t pid = fork();
-    if (pid < 0) {
+  log_line("scene-netnsctl: [veth-host] base wiring ready (%s on %s, MASQ for %s)",
+           kVethHostCidr, kVethHost, kVethNetCidr);
+  _exit(0);
+}
+
+// Stage 2 helper: pick the current upstream and (re)build table 99 + the
+// `iif scn-h` rule.  Idempotent.  Returns true when table 99 has a working
+// default route at exit.
+//
+// We run this inside a child process because we need to setns() into the
+// host netns to inspect routes and call `ip` / `iptables` — but we don't
+// want to drag the parent (which is pinned in the isolated netns) along.
+[[noreturn]] void routing_refresh_child() {
+  if (sys_setns(g_host_ns_fd, CLONE_NEWNET) != 0) {
+    log_line("scene-netnsctl: [route-refresh] setns(host) failed: %s",
+             std::strerror(errno));
+    _exit(2);
+  }
+
+  char ip_bin[256] = {};
+  if (!find_bin("ip", ip_bin, sizeof(ip_bin))) _exit(3);
+
+  // Capture current default routes from every table.
+  std::string routes;
+  {
+    int pipefd[2];
+    if (pipe(pipefd) != 0) _exit(4);
+    pid_t p = fork();
+    if (p < 0) {
       close(pipefd[0]); close(pipefd[1]);
-      return -1;
+      _exit(4);
     }
-    if (pid == 0) {
+    if (p == 0) {
       dup2(pipefd[1], STDOUT_FILENO);
       dup2(pipefd[1], STDERR_FILENO);
       close(pipefd[0]); close(pipefd[1]);
-      execv(bin, const_cast<char *const *>(argv.data()));
+      const char *argv[] = {ip_bin, "route", "show", "table", "all",
+                            "default", nullptr};
+      execv(ip_bin, const_cast<char *const *>(argv));
       _exit(127);
     }
     close(pipefd[1]);
     char buf[256];
     ssize_t n;
-    while ((n = read(pipefd[0], buf, sizeof(buf))) > 0) out->append(buf, n);
+    while ((n = read(pipefd[0], buf, sizeof(buf))) > 0) routes.append(buf, n);
     close(pipefd[0]);
-    int status = 0;
-    if (waitpid(pid, &status, 0) < 0) return -1;
-    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-  };
-
-  std::string upstream_routes;
-  std::vector<const char *> ip_show_argv = {ip_bin, "route", "show",
-                                            "table", "all", "default"};
-  if (run_capture_text(ip_bin, ip_show_argv, &upstream_routes) != 0 ||
-      upstream_routes.empty()) {
-    log_line("scene-netnsctl: [veth-host] no default route discovered; "
-             "outbound forward will fail");
-    _exit(13);
+    int st = 0;
+    waitpid(p, &st, 0);
   }
 
-  // Parse the first non-empty line: "default via <gw> dev <oif> ..."
+  // Skip these "fake" defaults the kernel installs on link-only interfaces
+  // (notably dummy0).  The first real default is what we want.
   std::string upstream_gw, upstream_oif;
   {
     size_t pos = 0;
-    while (pos < upstream_routes.size()) {
-      size_t eol = upstream_routes.find('\n', pos);
-      if (eol == std::string::npos) eol = upstream_routes.size();
-      std::string line = upstream_routes.substr(pos, eol - pos);
+    while (pos < routes.size()) {
+      size_t eol = routes.find('\n', pos);
+      if (eol == std::string::npos) eol = routes.size();
+      std::string line = routes.substr(pos, eol - pos);
       pos = eol + 1;
-      // Tokenize.
+
       std::vector<std::string> toks;
       size_t i = 0;
       while (i < line.size()) {
@@ -620,50 +637,105 @@ bool write_proc_file(const char *path, const char *value) {
         while (i < line.size() && line[i] != ' ' && line[i] != '\t') ++i;
         if (start < i) toks.push_back(line.substr(start, i - start));
       }
+      // Pattern: "default via <gw> dev <oif> ..."
       if (toks.size() >= 5 && toks[0] == "default" && toks[1] == "via" &&
           toks[3] == "dev") {
+        const std::string &oif = toks[4];
+        if (oif == "dummy0" || oif == "lo") continue;
         upstream_gw = toks[2];
-        upstream_oif = toks[4];
+        upstream_oif = oif;
         break;
       }
     }
   }
+
   if (upstream_gw.empty() || upstream_oif.empty()) {
-    log_line("scene-netnsctl: [veth-host] could not parse default route from: %s",
-             upstream_routes.c_str());
+    // Network not up yet, or no usable upstream.  Caller will retry.
     _exit(14);
   }
-  log_line("scene-netnsctl: [veth-host] upstream gw=%s oif=%s",
+
+  // Read previously-applied upstream from cache, skip if unchanged so we
+  // don't churn the routing table on every poll.
+  char prev[256] = {};
+  int cf = open(kUpstreamCachePath, O_RDONLY | O_CLOEXEC);
+  if (cf >= 0) {
+    ssize_t n = read(cf, prev, sizeof(prev) - 1);
+    close(cf);
+    if (n > 0) prev[n] = '\0';
+  }
+  std::string desired = upstream_gw + " " + upstream_oif + "\n";
+  if (std::strcmp(prev, desired.c_str()) == 0) {
+    _exit(0);  // already up to date
+  }
+
+  log_line("scene-netnsctl: [route-refresh] upstream gw=%s oif=%s",
            upstream_gw.c_str(), upstream_oif.c_str());
 
-  // Pre-clean any stale entries we may have left from a previous run.
-  Cmd c_rule_del = {ip_bin, "rule", "del", "iif", kVethHost,
-                    "table", "99"};
+  // Tear down any previous table 99 entries / rule.
   for (int i = 0; i < 4; ++i) {
-    if (run_capture(ip_bin, c_rule_del.argv(), "veth-host-cleanup") != 0) break;
+    Cmd c_rule_del = {ip_bin, "rule", "del", "iif", kVethHost,
+                      "table", "99"};
+    if (run_capture(ip_bin, c_rule_del.argv(), "route-refresh") != 0) break;
   }
   Cmd c_table_flush = {ip_bin, "route", "flush", "table", "99"};
-  run_capture(ip_bin, c_table_flush.argv(), "veth-host-cleanup");
+  run_capture(ip_bin, c_table_flush.argv(), "route-refresh");
 
-  // Build table 99 with default + the scn-h connected route.
+  // Rebuild table 99.
   Cmd c_route_dflt = {ip_bin, "route", "add", "default",
                       "via", upstream_gw.c_str(),
                       "dev", upstream_oif.c_str(),
                       "table", "99"};
-  if (run_capture(ip_bin, c_route_dflt.argv(), "veth-host") != 0) _exit(15);
+  if (run_capture(ip_bin, c_route_dflt.argv(), "route-refresh") != 0) _exit(15);
 
   Cmd c_route_link = {ip_bin, "route", "add", kVethNetCidr,
                       "dev", kVethHost, "table", "99"};
-  if (run_capture(ip_bin, c_route_link.argv(), "veth-host") != 0) _exit(16);
+  if (run_capture(ip_bin, c_route_link.argv(), "route-refresh") != 0) _exit(16);
 
-  // Steer traffic that arrives via scn-h into table 99.
   Cmd c_rule_add = {ip_bin, "rule", "add", "iif", kVethHost,
                     "pref", "11000", "table", "99"};
-  if (run_capture(ip_bin, c_rule_add.argv(), "veth-host") != 0) _exit(17);
+  if (run_capture(ip_bin, c_rule_add.argv(), "route-refresh") != 0) _exit(17);
 
-  log_line("scene-netnsctl: [veth-host] host side ready (%s on %s, MASQ for %s)",
-           kVethHostCidr, kVethHost, kVethNetCidr);
+  // Persist the chosen upstream so that the next poll can short-circuit.
+  cf = open(kUpstreamCachePath, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+  if (cf >= 0) {
+    write(cf, desired.c_str(), desired.size());
+    close(cf);
+  }
+
+  log_line("scene-netnsctl: [route-refresh] table 99 ready (default via %s dev %s)",
+           upstream_gw.c_str(), upstream_oif.c_str());
   _exit(0);
+}
+
+// Run routing_refresh_child once and wait for it.  Returns true on success.
+bool refresh_routing_once() {
+  pid_t p = fork();
+  if (p < 0) {
+    log_line("scene-netnsctl: [route-refresh] fork failed: %s", std::strerror(errno));
+    return false;
+  }
+  if (p == 0) routing_refresh_child();  // [[noreturn]]
+
+  int status = 0;
+  if (waitpid(p, &status, 0) < 0) return false;
+  return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+// Background watchdog: keep polling until refresh_routing_once succeeds, then
+// poll less aggressively to pick up wifi <-> mobile-data switches.
+void *routing_watchdog(void *) {
+  // First, retry quickly until the upstream comes up.
+  for (int attempt = 0; attempt < 60; ++attempt) {
+    if (refresh_routing_once()) break;
+    sleep(2);
+  }
+  // Steady state: poll every 30s.  This is cheap because the child caches
+  // the last applied upstream and exits early if nothing changed.
+  for (;;) {
+    sleep(30);
+    refresh_routing_once();
+  }
+  return nullptr;
 }
 
 bool setup_veth_and_routes() {
@@ -735,6 +807,22 @@ void pin_forever() {
     log_line("scene-netnsctl: [pinner] veth setup failed; outbound will not work");
   }
 
+  // Start the routing watchdog: it picks the current upstream and (re)builds
+  // table 99 + the iif scn-h rule.  On boot the wifi stack often hasn't come
+  // up yet by the time pinner starts, so the first attempt may have to wait.
+  // The watchdog also notices wifi <-> mobile-data switches and adapts.
+  if (net_ok) {
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_t tid;
+    if (pthread_create(&tid, &attr, routing_watchdog, nullptr) != 0) {
+      log_line("scene-netnsctl: [pinner] routing watchdog failed to start: %s",
+               std::strerror(errno));
+    }
+    pthread_attr_destroy(&attr);
+  }
+
   int server = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (server < 0) die("[pinner] socket");
   std::string sock_path = make_socket_path();
@@ -754,6 +842,7 @@ void pin_forever() {
     if (g_sock_path[0] != '\0') unlink(g_sock_path);
     unlink(kEndpointPath);
     unlink(kPidPath);
+    unlink(kUpstreamCachePath);
     _exit(0);
   });
 
