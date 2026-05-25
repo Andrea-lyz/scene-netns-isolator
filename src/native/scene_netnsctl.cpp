@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0
 #include <arpa/inet.h>
 #include <cerrno>
+#include <cstdarg>
 #include <cstdint>
 #include <csignal>
 #include <cstdio>
@@ -48,8 +49,18 @@ char g_sock_path[kUnixPathMax] = {};
 int g_host_ns_fd = -1;        // captured before unshare(): pinner's original netns
 int g_isolated_ns_fd = -1;    // captured after unshare():  the new isolated netns
 
+void log_line(const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  std::vfprintf(stderr, fmt, ap);
+  va_end(ap);
+  std::fputc('\n', stderr);
+  std::fflush(stderr);
+}
+
 void die(const char *message) {
   std::fprintf(stderr, "scene-netnsctl: %s: %s\n", message, std::strerror(errno));
+  std::fflush(stderr);
   std::exit(1);
 }
 
@@ -477,6 +488,9 @@ void *proxy_worker(void *arg) {
   int family = job->family;
   delete job;
 
+  log_line("scene-netnsctl: [proxy] worker accepted family=%d fd=%d",
+           family, client);
+
   // Pull the original destination out of the connection-tracker. This works
   // for v4 and v6 once the corresponding REDIRECT rule fired.
   sockaddr_storage orig {};
@@ -485,19 +499,27 @@ void *proxy_worker(void *arg) {
   if (family == AF_INET) {
     if (getsockopt(client, SOL_IP, SO_ORIGINAL_DST, &orig, &orig_len) == 0) {
       got_orig = true;
+      const auto *in4 = reinterpret_cast<const sockaddr_in *>(&orig);
+      char buf[64] = {};
+      inet_ntop(AF_INET, &in4->sin_addr, buf, sizeof(buf));
+      log_line("scene-netnsctl: [proxy] orig_dst=%s:%u",
+               buf, ntohs(in4->sin_port));
     } else {
-      std::fprintf(stderr,
-                   "scene-netnsctl: [proxy] SO_ORIGINAL_DST(v4) failed: %s\n",
-                   std::strerror(errno));
+      log_line("scene-netnsctl: [proxy] SO_ORIGINAL_DST(v4) failed: %s",
+               std::strerror(errno));
     }
   } else if (family == AF_INET6) {
     orig_len = sizeof(orig);
     if (getsockopt(client, SOL_IPV6, IP6T_SO_ORIGINAL_DST, &orig, &orig_len) == 0) {
       got_orig = true;
+      const auto *in6 = reinterpret_cast<const sockaddr_in6 *>(&orig);
+      char buf[INET6_ADDRSTRLEN] = {};
+      inet_ntop(AF_INET6, &in6->sin6_addr, buf, sizeof(buf));
+      log_line("scene-netnsctl: [proxy] orig_dst6=[%s]:%u",
+               buf, ntohs(in6->sin6_port));
     } else {
-      std::fprintf(stderr,
-                   "scene-netnsctl: [proxy] SO_ORIGINAL_DST(v6) failed: %s\n",
-                   std::strerror(errno));
+      log_line("scene-netnsctl: [proxy] SO_ORIGINAL_DST(v6) failed: %s",
+               std::strerror(errno));
     }
   }
 
@@ -508,42 +530,59 @@ void *proxy_worker(void *arg) {
 
   // Switch this thread into host netns to make the outbound connection.
   if (sys_setns(g_host_ns_fd, CLONE_NEWNET) != 0) {
-    std::fprintf(stderr,
-                 "scene-netnsctl: [proxy] setns(host) failed: %s\n",
-                 std::strerror(errno));
+    log_line("scene-netnsctl: [proxy] setns(host) failed: %s",
+             std::strerror(errno));
     close(client);
     return nullptr;
   }
+  log_line("scene-netnsctl: [proxy] in host netns; dialing upstream...");
 
   int upstream = socket(family, SOCK_STREAM | SOCK_CLOEXEC, 0);
   int connect_err = 0;
   if (upstream < 0) {
     connect_err = errno;
+    log_line("scene-netnsctl: [proxy] socket() failed: %s",
+             std::strerror(errno));
   } else {
     socklen_t addr_size = (family == AF_INET) ? sizeof(sockaddr_in)
                                               : sizeof(sockaddr_in6);
+    struct timeval tv;
+    tv.tv_sec = 8;
+    tv.tv_usec = 0;
+    setsockopt(upstream, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    setsockopt(upstream, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
     if (connect(upstream, reinterpret_cast<sockaddr *>(&orig), addr_size) != 0) {
       connect_err = errno;
+      log_line("scene-netnsctl: [proxy] upstream connect failed: %s",
+               std::strerror(errno));
       close(upstream);
       upstream = -1;
+    } else {
+      tv.tv_sec = 0;
+      tv.tv_usec = 0;
+      setsockopt(upstream, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+      setsockopt(upstream, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+      log_line("scene-netnsctl: [proxy] upstream connected");
     }
   }
 
   // Restore namespace before doing anything that might touch sockets we
   // expect to live in the isolated ns.
   if (sys_setns(g_isolated_ns_fd, CLONE_NEWNET) != 0) {
-    std::fprintf(stderr,
-                 "scene-netnsctl: [proxy] setns(isolated) restore failed: %s\n",
-                 std::strerror(errno));
+    log_line("scene-netnsctl: [proxy] setns(isolated) restore failed: %s",
+             std::strerror(errno));
   }
 
   if (upstream < 0) {
-    (void)connect_err;  // logged via stderr above by the kernel; nothing more we can do
+    (void)connect_err;
     close(client);
     return nullptr;
   }
 
+  log_line("scene-netnsctl: [proxy] splicing");
   splice_loop(client, upstream);
+  log_line("scene-netnsctl: [proxy] splice done");
   close(upstream);
   close(client);
   return nullptr;

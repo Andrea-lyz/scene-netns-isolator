@@ -23,7 +23,7 @@ fi
 : > "$LOG"
 chmod 0644 "$LOG"
 
-nohup "$CTL" pin >>"$LOG" 2>&1 &
+nohup "$CTL" pin >>"$LOG" 2>&1 < /dev/null &
 sleep 1
 if ! "$CTL" status >/dev/null 2>&1; then
   log -t scene-netns "failed to pin Scene netns; see $LOG"
