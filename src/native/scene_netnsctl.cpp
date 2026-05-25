@@ -708,6 +708,52 @@ bool find_iptables_binary(const char *family,
   return false;
 }
 
+bool find_ip_binary(char *out_path, size_t out_size) {
+  static const char *candidates[] = {
+      "/system/bin/ip",
+      "/system/xbin/ip",
+      "/vendor/bin/ip",
+      nullptr,
+  };
+  for (const char **p = candidates; *p; ++p) {
+    if (access(*p, X_OK) == 0) {
+      std::snprintf(out_path, out_size, "%s", *p);
+      return true;
+    }
+  }
+  return false;
+}
+
+// A fresh netns has only lo (UP) and a handful of DOWN tunnels with no routes.
+// Without any route the kernel rejects connect(non-loopback) with
+// ENETUNREACH BEFORE the iptables OUTPUT chain runs, so our NAT REDIRECT
+// rule never fires.  Adding a default route via lo makes every destination
+// "routable through lo", which gives the OUTPUT chain a chance to rewrite
+// the packet to 127.0.0.1:<proxy_port> and have it delivered locally.
+bool install_lo_default_route() {
+  char ip_bin[256] = {};
+  if (!find_ip_binary(ip_bin, sizeof(ip_bin))) {
+    std::fprintf(stderr,
+                 "scene-netnsctl: [proxy] no `ip` binary available; "
+                 "outbound traffic will fail\n");
+    return false;
+  }
+
+  const char *v4_args[] = {
+      ip_bin, "route", "add", "default", "dev", "lo", nullptr};
+  bool ok_v4 = run_iptables(ip_bin, "ip-route v4", v4_args);
+
+  const char *v6_args[] = {
+      ip_bin, "-6", "route", "add", "default", "dev", "lo", nullptr};
+  bool ok_v6 = run_iptables(ip_bin, "ip-route v6", v6_args);
+  if (!ok_v6) {
+    std::fprintf(stderr,
+                 "scene-netnsctl: [proxy] ipv6 default route via lo failed; "
+                 "v6 outbound will fail\n");
+  }
+  return ok_v4;
+}
+
 bool install_redirect_rules(uint16_t v4_port, uint16_t v6_port) {
   char v4_port_str[8];
   char v6_port_str[8];
@@ -800,6 +846,21 @@ void pin_forever() {
   // (other than to loopback) is now redirected to our listener; the kernel
   // remembers the original destination for SO_ORIGINAL_DST.
   //
+  // Two prerequisites must hold for this to work:
+  //   * the destination must be routable, otherwise the kernel returns
+  //     ENETUNREACH before the OUTPUT chain ever runs
+  //   * the OUTPUT chain must accept the REDIRECT target
+  //
+  // We satisfy the first by adding a default route via lo; everything is
+  // "routable" through loopback, and the REDIRECT target rewrites the packet
+  // to 127.0.0.1:<proxy_port> which is what we actually want.
+  bool route_ok = install_lo_default_route();
+  if (!route_ok) {
+    std::fprintf(stderr,
+                 "scene-netnsctl: [proxy] default route via lo not installed; "
+                 "outbound traffic will fail with ENETUNREACH\n");
+  }
+
   // If the kernel does not allow nat OUTPUT inside our netns we deliberately
   // do NOT die here.  The unix-socket netns service still works (so Zygisk
   // can put Scene in this netns) and the proxy listener exists; outbound
