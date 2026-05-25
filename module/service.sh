@@ -3,6 +3,7 @@ MODDIR=${0%/*}
 CTL="$MODDIR/bin/scene-netnsctl"
 RUNDIR=/dev/.15f1c4b9
 OLD_RUNDIR=/dev/scene-netns-isolator
+LOG="$RUNDIR/pinner.log"
 
 mkdir -p "$RUNDIR"
 chmod 0755 "$RUNDIR"
@@ -18,6 +19,12 @@ if "$CTL" status >/dev/null 2>&1; then
   exit 0
 fi
 
-nohup "$CTL" pin >/dev/null 2>&1 &
+# Truncate previous run's log so each boot is easy to read.
+: > "$LOG"
+chmod 0644 "$LOG"
+
+nohup "$CTL" pin >>"$LOG" 2>&1 &
 sleep 1
-"$CTL" status >/dev/null 2>&1 || log -t scene-netns "failed to pin Scene netns"
+if ! "$CTL" status >/dev/null 2>&1; then
+  log -t scene-netns "failed to pin Scene netns; see $LOG"
+fi

@@ -627,23 +627,41 @@ void *proxy_acceptor(void *arg) {
 
 bool run_iptables(const char *bin, const char *family_label,
                   const char *const *argv) {
+  // Capture child output so we can print it on failure and learn why the OEM
+  // kernel rejected the rule (typical: "table 'nat' does not exist", or "no
+  // chain/target/match by that name").
+  int pipefd[2] = {-1, -1};
+  if (pipe(pipefd) != 0) {
+    pipefd[0] = pipefd[1] = -1;
+  }
+
   pid_t pid = fork();
   if (pid < 0) {
+    if (pipefd[0] >= 0) { close(pipefd[0]); close(pipefd[1]); }
     std::fprintf(stderr, "scene-netnsctl: [proxy] fork %s failed: %s\n",
                  bin, std::strerror(errno));
     return false;
   }
   if (pid == 0) {
-    // Child: redirect noisy stdout/stderr to /dev/null; we will rely on the
-    // exit code as the only success signal.
-    int devnull = open("/dev/null", O_RDWR | O_CLOEXEC);
-    if (devnull >= 0) {
-      dup2(devnull, STDOUT_FILENO);
-      dup2(devnull, STDERR_FILENO);
-      close(devnull);
+    if (pipefd[1] >= 0) {
+      dup2(pipefd[1], STDOUT_FILENO);
+      dup2(pipefd[1], STDERR_FILENO);
+      close(pipefd[0]);
+      close(pipefd[1]);
     }
     execv(bin, const_cast<char *const *>(argv));
     _exit(127);
+  }
+
+  if (pipefd[1] >= 0) close(pipefd[1]);
+  std::string captured;
+  if (pipefd[0] >= 0) {
+    char buf[256];
+    ssize_t n;
+    while ((n = read(pipefd[0], buf, sizeof(buf))) > 0) {
+      captured.append(buf, static_cast<size_t>(n));
+    }
+    close(pipefd[0]);
   }
 
   int status = 0;
@@ -653,13 +671,41 @@ bool run_iptables(const char *bin, const char *family_label,
     return false;
   }
   if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     std::fprintf(stderr,
-                 "scene-netnsctl: [proxy] %s rule install failed (exit=%d, %s)\n",
-                 bin, WIFEXITED(status) ? WEXITSTATUS(status) : -1,
-                 family_label);
+                 "scene-netnsctl: [proxy] %s (%s) failed exit=%d output=<<%s>>\n",
+                 bin, family_label, exit_code,
+                 captured.empty() ? "(empty)" : captured.c_str());
     return false;
   }
   return true;
+}
+
+bool find_iptables_binary(const char *family,
+                          char *out_path, size_t out_size) {
+  // Order: prefer the legacy binary because Android's nf_tables backend on
+  // many OEM kernels lacks the `nat` table.  iptables-legacy talks ip_tables.so
+  // which still exposes nat OUTPUT in most ROMs.
+  const char *prefixes[] = {
+      "/system/bin/",
+      "/system/xbin/",
+      "/vendor/bin/",
+      nullptr,
+  };
+  const char *names_v4[] = {"iptables-legacy", "iptables", nullptr};
+  const char *names_v6[] = {"ip6tables-legacy", "ip6tables", nullptr};
+  const char **names = (strcmp(family, "ipv6") == 0) ? names_v6 : names_v4;
+  for (const char **p = prefixes; *p; ++p) {
+    for (const char **n = names; *n; ++n) {
+      char candidate[256];
+      std::snprintf(candidate, sizeof(candidate), "%s%s", *p, *n);
+      if (access(candidate, X_OK) == 0) {
+        std::snprintf(out_path, out_size, "%s", candidate);
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 bool install_redirect_rules(uint16_t v4_port, uint16_t v6_port) {
@@ -668,23 +714,40 @@ bool install_redirect_rules(uint16_t v4_port, uint16_t v6_port) {
   std::snprintf(v4_port_str, sizeof(v4_port_str), "%u", v4_port);
   std::snprintf(v6_port_str, sizeof(v6_port_str), "%u", v6_port);
 
+  char v4_bin[256] = {};
+  char v6_bin[256] = {};
+  bool have_v4_bin = find_iptables_binary("ipv4", v4_bin, sizeof(v4_bin));
+  bool have_v6_bin = find_iptables_binary("ipv6", v6_bin, sizeof(v6_bin));
+  if (!have_v4_bin) {
+    std::fprintf(stderr,
+                 "scene-netnsctl: [proxy] no iptables binary available; "
+                 "outbound redirect cannot be installed\n");
+    return false;
+  }
+
+  std::fprintf(stderr, "scene-netnsctl: [proxy] using v4=%s v6=%s\n",
+               v4_bin, have_v6_bin ? v6_bin : "(none)");
+
   const char *v4_args[] = {
-      "iptables", "-t", "nat", "-A", "OUTPUT",
+      v4_bin, "-t", "nat", "-A", "OUTPUT",
       "-p", "tcp", "!", "-d", "127.0.0.0/8",
       "-j", "REDIRECT", "--to-ports", v4_port_str, nullptr};
-  const char *v6_args[] = {
-      "ip6tables", "-t", "nat", "-A", "OUTPUT",
-      "-p", "tcp", "!", "-d", "::1",
-      "-j", "REDIRECT", "--to-ports", v6_port_str, nullptr};
 
-  bool ok_v4 = run_iptables("/system/bin/iptables", "ipv4", v4_args);
-  // ip6tables nat may not be configured on every kernel; treat v6 as best
-  // effort.
-  bool ok_v6 = run_iptables("/system/bin/ip6tables", "ipv6", v6_args);
+  bool ok_v4 = run_iptables(v4_bin, "ipv4", v4_args);
+
+  bool ok_v6 = false;
+  if (have_v6_bin) {
+    const char *v6_args[] = {
+        v6_bin, "-t", "nat", "-A", "OUTPUT",
+        "-p", "tcp", "!", "-d", "::1",
+        "-j", "REDIRECT", "--to-ports", v6_port_str, nullptr};
+    ok_v6 = run_iptables(v6_bin, "ipv6", v6_args);
+  }
+
   if (!ok_v6) {
     std::fprintf(stderr,
                  "scene-netnsctl: [proxy] ipv6 redirect unavailable; "
-                 "v6 outbound traffic will fail closed\n");
+                 "v6 outbound traffic will not work\n");
   }
   return ok_v4;
 }
@@ -736,8 +799,19 @@ void pin_forever() {
   // Plumb iptables nat OUTPUT inside the isolated netns. Any TCP connect
   // (other than to loopback) is now redirected to our listener; the kernel
   // remembers the original destination for SO_ORIGINAL_DST.
-  if (!install_redirect_rules(v4_port, v6_port)) {
-    die_msg("[proxy] failed to install ipv4 redirect rules");
+  //
+  // If the kernel does not allow nat OUTPUT inside our netns we deliberately
+  // do NOT die here.  The unix-socket netns service still works (so Zygisk
+  // can put Scene in this netns) and the proxy listener exists; outbound
+  // traffic will fail, but Scene's loopback isolation is preserved and the
+  // operator gets a chance to inspect the situation.
+  bool redirect_ok = install_redirect_rules(v4_port, v6_port);
+  if (!redirect_ok) {
+    std::fprintf(stderr,
+                 "scene-netnsctl: [proxy] iptables redirect not installed; "
+                 "outbound traffic will not work until this is resolved\n");
+  } else {
+    std::fprintf(stderr, "scene-netnsctl: [proxy] iptables redirect installed\n");
   }
 
   pthread_attr_t pattr;
