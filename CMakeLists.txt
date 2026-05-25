@@ -16,7 +16,9 @@ endif()
 
 add_library(scene_netns_zygisk SHARED src/zygisk/scene_netns_zygisk.cpp)
 target_include_directories(scene_netns_zygisk PRIVATE ${ZYGISK_API_INCLUDE})
-target_compile_options(scene_netns_zygisk PRIVATE
-  -Wall -Wextra -fno-exceptions -fno-rtti -fno-threadsafe-statics -fno-use-cxa-atexit)
-target_link_libraries(scene_netns_zygisk log)
-target_link_options(scene_netns_zygisk PRIVATE -nostdlib++)
+# We now use STL containers (std::vector / std::set / std::string) for PLT
+# hook bookkeeping, so RTTI/exceptions/threadsafe-statics stay on default
+# settings and we link libc++_static instead of dropping the C++ runtime.
+target_compile_options(scene_netns_zygisk PRIVATE -Wall -Wextra)
+target_link_libraries(scene_netns_zygisk log dl)
+target_link_options(scene_netns_zygisk PRIVATE -static-libstdc++)

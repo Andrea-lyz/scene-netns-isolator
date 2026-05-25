@@ -34,11 +34,10 @@ function Build-Arch {
 
     $soArgs = @(
         "-std=c++17", "-fPIC", "-shared", "-Wall", "-Wextra", "-Os",
-        "-fno-exceptions", "-fno-rtti", "-fno-threadsafe-statics", "-fno-use-cxa-atexit",
         "-I$ZygiskInclude",
         "$Root\src\zygisk\scene_netns_zygisk.cpp",
-        "-llog",
-        "-nostdlib++",
+        "-llog", "-ldl",
+        "-static-libstdc++",
         "-o", "$BuildDir\arm.so"
     )
     & $Cxx @soArgs
