@@ -1,119 +1,144 @@
 # Scene Netns Isolator
 
-> Per-app network namespace isolation for Scene (`com.omarea.vtools`) on rooted Android devices.
+> Per-app network namespace isolation for Scene (`com.omarea.vtools`) on rooted Android.
+
+[中文 README](README.md)
 
 ---
 
 ## Overview
 
-Scene Netns Isolator is a Magisk + Zygisk based network namespace isolation module designed specifically for Scene.
+Scene Netns Isolator is a Zygisk-based Android module that puts the Scene app
+process and its root daemon into a private Linux network namespace. They keep
+talking to each other over loopback as before, but the host system and every
+other app on the device sees nothing. Probes from other apps that try to
+detect Scene by scanning `127.0.0.1:8788` (or any of the other ports Scene
+uses) get a clean `ECONNREFUSED` that is **indistinguishable from "Scene is
+not running"**.
 
-Its primary goal is to place the Scene app process and its root daemon into the same isolated Linux network namespace, so they can communicate through their own private loopback environment without conflicting with ports already occupied by the host system or other applications.
-
-Typical ports affected include:
-
-- `127.0.0.1:8788`
-- `127.0.0.1:8765`
-
-The project does not modify Scene itself. Instead, it provides isolation externally at the process / namespace level.
-
----
-
-## Features
-
-- Per-app network namespace isolation
-- Isolates Scene without affecting the global system network stack
-- Keeps Scene app and root daemon inside the same namespace
-- Supports both `arm64-v8a` and `armeabi-v7a`
-- Works through Zygisk process specialization
-- Preserves localhost communication via isolated `lo`
-- Does not require modifying Scene APK
+The module never modifies the Scene APK and never writes any
+host-visible iptables rules. All side effects are confined to Scene's own
+namespace.
 
 ---
 
-## Architecture
+## How it works
 
-The module consists of three major components:
-
-### 1. `scene-netnsctl`
-
-Native controller responsible for namespace lifecycle management.
-
-Boot sequence:
-
-```text
-service.sh
-    ↓
-scene-netnsctl pin
-    ↓
-unshare(CLONE_NEWNET)
-    ↓
-bring up lo
-    ↓
-keep namespace alive with persistent pinner
+```
+host netns                                 isolated netns (per-pinner)
+─────────────                             ────────────────────────────
+                                           scene UI ─┐
+scene-netnsctl pin (root) ──── unshare ──▶ daemon  ─┴─▶ 127.0.0.1:14754
+                                           scn-i  10.99.99.2/30
+                                               │
+                                               │ veth pair
+                                               ▼
+scn-h  10.99.99.1/30 ──── iptables nat MASQUERADE ──▶ wlan0 / rmnet_data*
+                                               ┆
+ip rule iif scn-h ─────▶ table 99
+                                               ┆
+                                               ▼
+                          AF_NETLINK monitor (host netns) → refresh table 99 on route changes
 ```
 
-The controller:
+Four moving parts:
 
-- creates a dedicated network namespace
-- enables loopback (`lo`)
-- pins the namespace with a persistent process
-- exposes namespace FD transfer through Unix domain sockets
+### 1. `scene-netnsctl` (native controller)
 
----
+- `unshare(CLONE_NEWNET)` to create the isolated netns and pin it.
+- Spawns a veth pair across the boundary: `scn-h` on host, `scn-i` on
+  isolated.
+- Installs `iptables -t nat MASQUERADE`, FORWARD ACCEPT rules, and a private
+  routing table 99.
+- A background watchdog subscribes to AF_NETLINK route events and refreshes
+  table 99 with sub-second latency on wifi <-> mobile-data handovers.
 
 ### 2. Zygisk module
 
-When the target process belongs to `com.omarea.vtools`, the module:
+When the target process is identified as Scene:
 
-1. connects to the Zygisk root companion
-2. lets the companion connect to the namespace pinner
-3. receives the forwarded namespace FD through `SCM_RIGHTS`
-4. calls `setns(CLONE_NEWNET)`
+1. Connects to the root companion to fetch the pinned netns FD.
+2. Calls `setns(CLONE_NEWNET)` early in `preAppSpecialize`.
+3. Asks Zygisk for `DLCLOSE_MODULE_LIBRARY` so the module's library is no
+   longer mapped in the target process.
 
-This causes the Scene process to start directly inside the isolated namespace.
-
-After specialization handling is finished, the module asks Zygisk to unload the module library to reduce module mapping residue in the target process lifetime.
-
----
+Every socket Scene creates afterwards lives entirely inside the isolated
+netns.
 
 ### 3. `su` wrapper
 
-Scene frequently launches privileged daemons through `su -c`.
-
-To prevent namespace splitting, the module replaces the original invocation with:
+Scene starts privileged daemons via `su -c <cmd>`. The wrapper rewrites the
+invocation to:
 
 ```sh
 scene-netnsctl enter -- /system/bin/sh -c '<original command>'
 ```
 
-This guarantees:
+so the daemon enters the same isolated namespace as the UI and the two halves
+keep finding each other over loopback.
 
-- Scene app
-- root shell
-- daemon process
+### 4. veth + custom routing (new in v1.0.0)
 
-all remain inside the same namespace.
+Android stores default routes in per-network tables (`wlan0`,
+`rmnet_data0`, …) selected by netd-managed fwmark rules. Forwarded packets
+arriving from the isolated netns carry no fwmark and no matching uid, so the
+kernel walks `main` and finds nothing — packets get dropped before they ever
+hit the FORWARD chain.
 
----
-
-## Why This Exists
-
-Android applications normally share the host network namespace.
-
-This becomes problematic when:
-
-- multiple tools bind fixed localhost ports
-- daemons assume exclusive ownership of loopback sockets
-- root helper services conflict with other apps
-
-Using Linux network namespaces avoids modifying application logic while still providing isolated networking environments.
-
-Naturally, it is possible that there are other, more compelling reasons.
+The fix: install `ip rule iif scn-h pref 11000 lookup 99` and let the
+watchdog mirror whichever default the device currently uses into table 99.
+Netlink notifies us on every route change, so wifi disconnects, cellular
+handovers, and ConnectivityService transitions are all picked up
+automatically.
 
 ---
 
-## Repository Layout
+## Why bother
+
+Other apps trying to detect Scene by probing `127.0.0.1:8788` get
+`ECONNREFUSED`, which is the **same response they would get from a clean
+device that has never run Scene**. Compared to BPF rewriting or iptables
+redirection, this is a much quieter detection surface — there is no signal
+to detect.
+
+---
+
+## Compatibility matrix
+
+| Platform | Status | Notes |
+|---|---|---|
+| OnePlus 13 / ColorOS 16 + KernelSU + ZygiskNext | ✅ Verified | Reference device. Full Scene login + in-app billing works. |
+| AOSP / Pixel | 🟢 High confidence | No OEM-specific routing quirks expected. |
+| Samsung One UI | 🟡 Should work | AOSP-derived. Untested. |
+| Xiaomi HyperOS / MIUI | 🟡 Should work | Same kernel capabilities. Untested. |
+| vivo OriginOS / iQOO | 🟡 Should work | Untested. |
+| Older EMUI / Magic UI | 🟡 Should work | Still Linux kernel. Untested. |
+| HarmonyOS NEXT | ❌ Won't work | Microkernel; no Linux netns. |
+| Game-ROMs that strip NF_NAT | ❌ Won't work | iptables nat table missing. |
+
+### Root managers
+
+- **KernelSU** does **not** ship Zygisk. You need
+  [ZygiskNext](https://github.com/Dr-TSNG/ZygiskNext) or ReZygisk.
+- **Magisk** has built-in Zygisk; just enable it.
+- **APatch** ships a Zygisk shim and should also work.
+
+### Android version
+
+- Android 12+: ✅ primary target
+- Android 10/11: ⚠️ needs Magisk 24+ for Zygisk API v4
+- Android 9 and below: ❌ not recommended
+
+### Kernel requirements (every modern Android device satisfies these)
+
+- `CONFIG_NET_NS` and `CONFIG_VETH`
+- `CONFIG_NF_NAT` and `CONFIG_NF_NAT_MASQUERADE`
+- `CONFIG_IP_MULTIPLE_TABLES`
+- `CONFIG_IP_NF_FILTER` (FORWARD chain)
+
+---
+
+## Repository layout
 
 ```text
 module/
@@ -123,11 +148,11 @@ module/
   customize.sh
 
 src/native/
-  scene_netnsctl.cpp
-  su_wrapper.cpp
+  scene_netnsctl.cpp     # netns pinner + veth/iptables + routing watchdog
+  su_wrapper.cpp         # transparently turns `su -c` into `enter --`
 
 src/zygisk/
-  scene_netns_zygisk.cpp
+  scene_netns_zygisk.cpp # process setns injection
 
 scripts/
   build-native.sh
@@ -139,111 +164,112 @@ scripts/
 
 ## Build
 
-Android NDK r27 or newer is recommended.
+Android NDK r27 or newer recommended.
 
 ### Linux
 
 ```sh
-ANDROID_NDK_HOME=/path/to/ndk \
-bash scripts/build-native.sh
-```
-
-Package module:
-
-```sh
+ANDROID_NDK_HOME=/path/to/ndk bash scripts/build-native.sh
 (cd module && zip -r ../scene-netns-isolator.zip .)
 ```
-
----
 
 ### Windows
 
 ```powershell
-powershell -ExecutionPolicy Bypass `
-  -File .\scripts\build-native.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\build-native.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\package.ps1
 ```
 
-Package module:
-
-```powershell
-powershell -ExecutionPolicy Bypass `
-  -File .\scripts\package.ps1
-```
+CI builds and publishes a release zip on every push to `main`.
 
 ---
 
 ## Installation
 
-1. Flash the generated zip in Magisk
-2. Enable Zygisk
-3. Reboot the device
-4. Launch Scene
+1. Install KernelSU (1.0+) + ZygiskNext, or Magisk + Zygisk.
+2. Flash `scene-netns-isolator-*.zip` from the root manager.
+3. Reboot.
+4. Launch Scene.
 
 ---
 
 ## Verification
 
-Check namespace status:
-
 ```sh
-su -c /data/adb/modules/scene-netns-isolator/bin/scene-netnsctl status
+su
+
+# 1. Pinner status
+/data/adb/modules/scene-netns-isolator/bin/scene-netnsctl status
+
+# 2. Is Scene actually in the isolated namespace?
+#    The two inodes should differ.
+readlink /proc/$(pidof com.omarea.vtools)/ns/net
+readlink /proc/1/ns/net
+
+# 3. Are Scene's ports invisible from host?  Should print nothing.
+ss -ltnp | grep -E ":8788|:8765|:14754"
+
+# 4. Can the isolated ns reach the internet?
+/data/adb/modules/scene-netns-isolator/bin/scene-netnsctl enter -- \
+    /system/bin/sh -c 'curl -m 5 -sI http://1.1.1.1/'
 ```
-
-Check Scene namespace:
-
-```sh
-su -c 'readlink /proc/$(pidof com.omarea.vtools)/ns/net'
-```
-
-Check listening ports:
-
-```sh
-su -c 'ss -ltnp | grep -E ":8788|:8765"'
-```
-
-If isolation works correctly:
-
-- Scene and its daemon should share the same namespace
-- Host processes should remain outside that namespace
 
 ---
 
-## Compatibility
+## Troubleshooting
 
-Requirements:
+The pinner writes everything to **`/dev/.15f1c4b9/pinner.log`**.
 
-- Root access
-- Magisk
-- Zygisk
-- Kernel support for `CLONE_NEWNET`
-
----
-
-## Security Notes
-
-The project is designed to minimize observable global system changes.
-
-Current implementation avoids:
-
-- modifying global routing tables
-- altering host namespace sockets
-- patching Scene APK
-- replacing Android framework components
-
-Namespace transfer is performed through Unix domain sockets with credential validation (`SO_PEERCRED`) to reduce unauthorized access risk.
-
-The Zygisk process does not read the root-private endpoint directly. Privileged access is handled by the Zygisk root companion, which forwards the namespace FD back to the target process.
+| Error | Meaning / Action |
+|---|---|
+| `host helper exited with N` | veth/iptables setup failed; `N` is the `_exit(N)` line in source. |
+| `iptables: table nat does not exist` | Kernel was built without NF_NAT. Switch ROMs/kernels. |
+| `... table empty; treating as unstable` | Network handover in progress, watchdog is waiting. Normal. |
+| `RTNETLINK answers: ...` | Kernel/OEM rejected an `ip` command; share contents in an issue. |
+| `[route-watchdog] netlink bind failed` | SELinux blocked AF_NETLINK; watchdog falls back to 30s polling automatically. |
+| Everything looks fine but Scene can't connect | Open an issue with `iptables -L -n -v`, `iptables -t nat -L -n -v`, `ip rule`, `ip route show table all`. |
 
 ---
 
-## Limitations
+## Security notes
 
-- Package name is currently hardcoded to `com.omarea.vtools`
-- Changes in Scene startup behavior may require matcher updates
-- Some aggressive anti-hook / anti-root environments may still detect Zygisk presence
+- veth only connects the isolated and host namespaces; no bridge, no other
+  app traffic touches it.
+- iptables changes are limited to one nat POSTROUTING rule (matches only
+  the 10.99.99.0/30 source) and two FORWARD ACCEPT rules. Other traffic
+  unaffected.
+- No modifications to the Scene APK.
+- No writes to the global `main` routing table; only the private table 99.
+- Namespace FD transfer uses unix domain sockets gated by `SO_PEERCRED`;
+  non-root clients are rejected.
+- The Zygisk module dlclose-s itself once setns is done, so the target
+  process keeps no module library mapped.
+
+---
+
+## Known limitations
+
+- Package name is hard-coded to `com.omarea.vtools` (Scene 9.x).
+- After veth + MASQUERADE, Android's `NetworkStatsManager` will report the
+  Scene UID as having zero traffic on wifi/mobile (sk_uid is lost during
+  SNAT). Functional impact: none. Optical impact: visible in some apps.
+- IPv6 upstream is not configured. Scene is IPv4-only and OkHttp falls back
+  to v4 in milliseconds, so this is invisible.
+- Aggressive anti-root environments will still notice Zygisk and the custom
+  veth interface, but that is orthogonal to this module's threat model
+  (preventing other apps from probing Scene's ports).
+
+---
+
+## Credits
+
+- Original project: [NatumRagnag/scene-netns-isolator](https://github.com/NatumRagnag/scene-netns-isolator)
+  established the setns + Zygisk skeleton.
+- v1.0.0 added outbound connectivity, custom routing, and live route-event
+  handling.
 
 ---
 
 ## License
 
-Licensed under GNU GPL v3.
+GPL-3.0
