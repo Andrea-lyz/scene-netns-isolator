@@ -5,7 +5,7 @@ RUNDIR=/dev/.15f1c4b9
 OLD_RUNDIR=/dev/scene-netns-isolator
 
 mkdir -p "$RUNDIR"
-chmod 0700 "$RUNDIR"
+chmod 0755 "$RUNDIR"
 umount "$OLD_RUNDIR/scene.netns" 2>/dev/null
 rm -rf "$OLD_RUNDIR" 2>/dev/null
 

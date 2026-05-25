@@ -49,10 +49,11 @@ build_arch() {
     -o "${build_dir}/su" -static-libstdc++
 
   "${cxx}" -std=c++17 -fPIC -shared -Wall -Wextra -Os \
+    -fno-exceptions -fno-rtti -fno-threadsafe-statics -fno-use-cxa-atexit \
     -I"${ZYGISK_INCLUDE}" \
     "${ROOT}/src/zygisk/scene_netns_zygisk.cpp" \
-    -llog -ldl \
-    -static-libstdc++ \
+    -llog \
+    -nostdlib++ \
     -o "${build_dir}/zygisk.so"
 
   if [[ -x "${strip}" ]]; then

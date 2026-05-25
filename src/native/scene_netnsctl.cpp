@@ -9,6 +9,8 @@
 #include <ctime>
 #include <fcntl.h>
 #include <linux/if.h>
+#include <linux/netfilter_ipv4.h>
+#include <linux/netfilter_ipv6/ip6_tables.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
@@ -20,22 +22,23 @@
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
-#include "../common/proxy_protocol.h"
 #include "../common/runtime_paths.h"
+
+#ifndef SO_ORIGINAL_DST
+#define SO_ORIGINAL_DST 80
+#endif
+
+#ifndef IP6T_SO_ORIGINAL_DST
+#define IP6T_SO_ORIGINAL_DST 80
+#endif
 
 namespace {
 
 using scene_netns::kEndpointPath;
 using scene_netns::kPidPath;
-using scene_netns::kProxyFamilyV4;
-using scene_netns::kProxyFamilyV6;
-using scene_netns::kProxyHandshakeSize;
-using scene_netns::kProxyHandshakeVersion;
-using scene_netns::kProxyPortPath;
-using scene_netns::kProxyStatusErr;
-using scene_netns::kProxyStatusOk;
 using scene_netns::kRunDir;
 using scene_netns::kUnixPathMax;
 
@@ -43,7 +46,7 @@ constexpr const char *kDefaultShell = "/system/bin/sh";
 
 char g_sock_path[kUnixPathMax] = {};
 int g_host_ns_fd = -1;        // captured before unshare(): pinner's original netns
-int g_isolated_ns_fd = -1;    // captured after unshare(): the new isolated netns
+int g_isolated_ns_fd = -1;    // captured after unshare():  the new isolated netns
 
 void die(const char *message) {
   std::fprintf(stderr, "scene-netnsctl: %s: %s\n", message, std::strerror(errno));
@@ -56,10 +59,14 @@ void die_msg(const char *message) {
 }
 
 void ensure_run_dir() {
-  if (mkdir(kRunDir, 0700) != 0 && errno != EEXIST) {
+  // 0755 so that processes inside the isolated netns (apps, root daemons,
+  // anything we explicitly setns into) can later traverse the directory if we
+  // ever publish world-readable status files. Currently nothing in here is
+  // world-readable, but 0755 on the directory itself is safe.
+  if (mkdir(kRunDir, 0755) != 0 && errno != EEXIST) {
     die("mkdir run dir");
   }
-  chmod(kRunDir, 0700);
+  chmod(kRunDir, 0755);
 }
 
 bool path_is_in_run_dir(const char *path) {
@@ -374,26 +381,6 @@ void write_endpoint_file(const char *sock_path) {
   chmod(kEndpointPath, 0600);
 }
 
-void write_proxy_port_file(uint16_t port) {
-  // World-readable: any process inside the isolated netns must be able to
-  // discover the proxy port without needing privileged IPC.  The data leaked
-  // is just a port number, which is meaningless outside the isolated netns.
-  int fd = open(kProxyPortPath, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0644);
-  if (fd < 0) {
-    die("[pinner] open proxy port file");
-  }
-  char buf[16];
-  int n = std::snprintf(buf, sizeof(buf), "%u\n", static_cast<unsigned>(port));
-  if (write(fd, buf, n) != n) {
-    int saved = errno;
-    close(fd);
-    errno = saved;
-    die("[pinner] write proxy port file");
-  }
-  close(fd);
-  chmod(kProxyPortPath, 0644);
-}
-
 void cleanup_stale_endpoint() {
   char stale_path[kUnixPathMax] {};
   if (read_endpoint_path(stale_path, sizeof(stale_path), true)) {
@@ -401,35 +388,24 @@ void cleanup_stale_endpoint() {
   }
   unlink(kEndpointPath);
   unlink(kPidPath);
-  unlink(kProxyPortPath);
 }
 
 // ---------------------------------------------------------------------------
-// Transparent TCP proxy living inside the isolated netns.
+// In-netns transparent TCP proxy.
 //
-// When the Zygisk module wants to reach the public internet it pretends to
-// connect() to its real target but is silently redirected (in user space, via
-// PLT hooks) to 127.0.0.1:<proxy_port> in the isolated netns.  It then writes
-// a fixed-size handshake describing the original destination.  The proxy
-// reads the handshake, dials the target from the host netns, replies with
-// the status byte, and pipes bytes between the two halves until either side
-// closes.
+// We rely on iptables nat OUTPUT REDIRECT to bend every non-loopback TCP
+// connect inside the isolated netns to our local listener. The kernel keeps
+// the original destination accessible via getsockopt(SO_ORIGINAL_DST), so the
+// app process needs no userspace cooperation: it just calls connect() on
+// the real address as if the host network was reachable.
+//
+// On accept() the proxy:
+//   1. reads the original destination via SO_ORIGINAL_DST
+//   2. setns(host) so the outbound socket is born in host netns
+//   3. dial the real destination
+//   4. setns(isolated) so the next accept() runs in the right ns
+//   5. splice bytes between client and upstream until either side closes
 // ---------------------------------------------------------------------------
-
-bool read_full_blocking(int fd, void *buf, size_t len) {
-  uint8_t *p = static_cast<uint8_t *>(buf);
-  while (len > 0) {
-    ssize_t n = recv(fd, p, len, 0);
-    if (n < 0) {
-      if (errno == EINTR) continue;
-      return false;
-    }
-    if (n == 0) return false;
-    p += n;
-    len -= static_cast<size_t>(n);
-  }
-  return true;
-}
 
 bool write_full_blocking(int fd, const void *buf, size_t len) {
   const uint8_t *p = static_cast<const uint8_t *>(buf);
@@ -446,32 +422,24 @@ bool write_full_blocking(int fd, const void *buf, size_t len) {
   return true;
 }
 
-void send_proxy_error(int client_fd, int err) {
-  uint8_t status = kProxyStatusErr;
-  uint32_t err_be = htonl(err > 0 ? static_cast<uint32_t>(err)
-                                  : static_cast<uint32_t>(ECONNREFUSED));
-  write_full_blocking(client_fd, &status, sizeof(status));
-  write_full_blocking(client_fd, &err_be, sizeof(err_be));
-}
-
 void splice_loop(int a, int b) {
-  // Half-duplex shutdown: when one side closes for read we shutdown(write) on
-  // the other.  Connection is fully torn down once both directions are done.
   bool a_to_b_open = true;
   bool b_to_a_open = true;
   uint8_t buf[16384];
 
-  pollfd pfds[2];
   while (a_to_b_open || b_to_a_open) {
+    pollfd pfds[2];
     int n = 0;
     if (a_to_b_open) {
       pfds[n].fd = a;
       pfds[n].events = POLLIN;
+      pfds[n].revents = 0;
       ++n;
     }
     if (b_to_a_open) {
       pfds[n].fd = b;
       pfds[n].events = POLLIN;
+      pfds[n].revents = 0;
       ++n;
     }
     int rv = poll(pfds, n, -1);
@@ -500,75 +468,69 @@ void splice_loop(int a, int b) {
 
 struct ProxyJob {
   int client_fd;
+  int family;  // AF_INET or AF_INET6
 };
 
 void *proxy_worker(void *arg) {
   ProxyJob *job = static_cast<ProxyJob *>(arg);
   int client = job->client_fd;
+  int family = job->family;
   delete job;
 
-  uint8_t handshake[kProxyHandshakeSize] = {};
-  if (!read_full_blocking(client, handshake, sizeof(handshake))) {
-    close(client);
-    return nullptr;
-  }
-  if (handshake[0] != kProxyHandshakeVersion) {
-    send_proxy_error(client, EPROTO);
-    close(client);
-    return nullptr;
+  // Pull the original destination out of the connection-tracker. This works
+  // for v4 and v6 once the corresponding REDIRECT rule fired.
+  sockaddr_storage orig {};
+  socklen_t orig_len = sizeof(orig);
+  bool got_orig = false;
+  if (family == AF_INET) {
+    if (getsockopt(client, SOL_IP, SO_ORIGINAL_DST, &orig, &orig_len) == 0) {
+      got_orig = true;
+    } else {
+      std::fprintf(stderr,
+                   "scene-netnsctl: [proxy] SO_ORIGINAL_DST(v4) failed: %s\n",
+                   std::strerror(errno));
+    }
+  } else if (family == AF_INET6) {
+    orig_len = sizeof(orig);
+    if (getsockopt(client, SOL_IPV6, IP6T_SO_ORIGINAL_DST, &orig, &orig_len) == 0) {
+      got_orig = true;
+    } else {
+      std::fprintf(stderr,
+                   "scene-netnsctl: [proxy] SO_ORIGINAL_DST(v6) failed: %s\n",
+                   std::strerror(errno));
+    }
   }
 
-  uint8_t family = handshake[1];
-  uint16_t port_be = 0;
-  std::memcpy(&port_be, handshake + 2, sizeof(port_be));
+  if (!got_orig) {
+    close(client);
+    return nullptr;
+  }
 
   // Switch this thread into host netns to make the outbound connection.
   if (sys_setns(g_host_ns_fd, CLONE_NEWNET) != 0) {
-    int err = errno;
     std::fprintf(stderr,
                  "scene-netnsctl: [proxy] setns(host) failed: %s\n",
-                 std::strerror(err));
-    send_proxy_error(client, err);
+                 std::strerror(errno));
     close(client);
     return nullptr;
   }
 
-  int upstream = -1;
+  int upstream = socket(family, SOCK_STREAM | SOCK_CLOEXEC, 0);
   int connect_err = 0;
-  if (family == kProxyFamilyV4) {
-    sockaddr_in dst {};
-    dst.sin_family = AF_INET;
-    dst.sin_port = port_be;
-    std::memcpy(&dst.sin_addr, handshake + 4, sizeof(dst.sin_addr));
-    upstream = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (upstream < 0) {
-      connect_err = errno;
-    } else if (connect(upstream, reinterpret_cast<sockaddr *>(&dst),
-                       sizeof(dst)) != 0) {
-      connect_err = errno;
-      close(upstream);
-      upstream = -1;
-    }
-  } else if (family == kProxyFamilyV6) {
-    sockaddr_in6 dst {};
-    dst.sin6_family = AF_INET6;
-    dst.sin6_port = port_be;
-    std::memcpy(&dst.sin6_addr, handshake + 4, sizeof(dst.sin6_addr));
-    upstream = socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (upstream < 0) {
-      connect_err = errno;
-    } else if (connect(upstream, reinterpret_cast<sockaddr *>(&dst),
-                       sizeof(dst)) != 0) {
-      connect_err = errno;
-      close(upstream);
-      upstream = -1;
-    }
+  if (upstream < 0) {
+    connect_err = errno;
   } else {
-    connect_err = EAFNOSUPPORT;
+    socklen_t addr_size = (family == AF_INET) ? sizeof(sockaddr_in)
+                                              : sizeof(sockaddr_in6);
+    if (connect(upstream, reinterpret_cast<sockaddr *>(&orig), addr_size) != 0) {
+      connect_err = errno;
+      close(upstream);
+      upstream = -1;
+    }
   }
 
-  // Switch back to isolated netns so subsequent accept()s are correct.  Any
-  // failure here is non-fatal; we just log.
+  // Restore namespace before doing anything that might touch sockets we
+  // expect to live in the isolated ns.
   if (sys_setns(g_isolated_ns_fd, CLONE_NEWNET) != 0) {
     std::fprintf(stderr,
                  "scene-netnsctl: [proxy] setns(isolated) restore failed: %s\n",
@@ -576,14 +538,7 @@ void *proxy_worker(void *arg) {
   }
 
   if (upstream < 0) {
-    send_proxy_error(client, connect_err);
-    close(client);
-    return nullptr;
-  }
-
-  uint8_t ok = kProxyStatusOk;
-  if (!write_full_blocking(client, &ok, sizeof(ok))) {
-    close(upstream);
+    (void)connect_err;  // logged via stderr above by the kernel; nothing more we can do
     close(client);
     return nullptr;
   }
@@ -594,35 +549,55 @@ void *proxy_worker(void *arg) {
   return nullptr;
 }
 
-uint16_t start_proxy_listener(int *out_listener_fd) {
-  int listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+uint16_t bind_listener(int family, int *out_listener_fd) {
+  int listener = socket(family, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (listener < 0) {
     die("[proxy] socket");
   }
   int yes = 1;
   setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 
-  sockaddr_in addr {};
-  addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  addr.sin_port = 0;  // kernel-assigned ephemeral port
-  if (bind(listener, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
-    die("[proxy] bind");
-  }
-  socklen_t len = sizeof(addr);
-  if (getsockname(listener, reinterpret_cast<sockaddr *>(&addr), &len) != 0) {
-    die("[proxy] getsockname");
+  uint16_t port = 0;
+  if (family == AF_INET) {
+    sockaddr_in addr {};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    if (bind(listener, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
+      die("[proxy] bind v4");
+    }
+    socklen_t l = sizeof(addr);
+    getsockname(listener, reinterpret_cast<sockaddr *>(&addr), &l);
+    port = ntohs(addr.sin_port);
+  } else {
+    sockaddr_in6 addr {};
+    addr.sin6_family = AF_INET6;
+    addr.sin6_addr = in6addr_loopback;
+    addr.sin6_port = 0;
+    if (bind(listener, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
+      die("[proxy] bind v6");
+    }
+    socklen_t l = sizeof(addr);
+    getsockname(listener, reinterpret_cast<sockaddr *>(&addr), &l);
+    port = ntohs(addr.sin6_port);
   }
   if (listen(listener, 64) != 0) {
     die("[proxy] listen");
   }
   *out_listener_fd = listener;
-  return ntohs(addr.sin_port);
+  return port;
 }
 
+struct AcceptArg {
+  int listener;
+  int family;
+};
+
 void *proxy_acceptor(void *arg) {
-  int listener = *static_cast<int *>(arg);
-  delete static_cast<int *>(arg);
+  AcceptArg *a = static_cast<AcceptArg *>(arg);
+  int listener = a->listener;
+  int family = a->family;
+  delete a;
 
   for (;;) {
     int client = accept(listener, nullptr, nullptr);
@@ -635,7 +610,7 @@ void *proxy_acceptor(void *arg) {
     int flags = fcntl(client, F_GETFD);
     if (flags >= 0) fcntl(client, F_SETFD, flags | FD_CLOEXEC);
 
-    auto *job = new ProxyJob{client};
+    auto *job = new ProxyJob{client, family};
     pthread_t tid;
     pthread_attr_t pattr;
     pthread_attr_init(&pattr);
@@ -648,6 +623,70 @@ void *proxy_acceptor(void *arg) {
     pthread_attr_destroy(&pattr);
   }
   return nullptr;
+}
+
+bool run_iptables(const char *bin, const char *family_label,
+                  const char *const *argv) {
+  pid_t pid = fork();
+  if (pid < 0) {
+    std::fprintf(stderr, "scene-netnsctl: [proxy] fork %s failed: %s\n",
+                 bin, std::strerror(errno));
+    return false;
+  }
+  if (pid == 0) {
+    // Child: redirect noisy stdout/stderr to /dev/null; we will rely on the
+    // exit code as the only success signal.
+    int devnull = open("/dev/null", O_RDWR | O_CLOEXEC);
+    if (devnull >= 0) {
+      dup2(devnull, STDOUT_FILENO);
+      dup2(devnull, STDERR_FILENO);
+      close(devnull);
+    }
+    execv(bin, const_cast<char *const *>(argv));
+    _exit(127);
+  }
+
+  int status = 0;
+  if (waitpid(pid, &status, 0) < 0) {
+    std::fprintf(stderr, "scene-netnsctl: [proxy] waitpid %s: %s\n",
+                 bin, std::strerror(errno));
+    return false;
+  }
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    std::fprintf(stderr,
+                 "scene-netnsctl: [proxy] %s rule install failed (exit=%d, %s)\n",
+                 bin, WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+                 family_label);
+    return false;
+  }
+  return true;
+}
+
+bool install_redirect_rules(uint16_t v4_port, uint16_t v6_port) {
+  char v4_port_str[8];
+  char v6_port_str[8];
+  std::snprintf(v4_port_str, sizeof(v4_port_str), "%u", v4_port);
+  std::snprintf(v6_port_str, sizeof(v6_port_str), "%u", v6_port);
+
+  const char *v4_args[] = {
+      "iptables", "-t", "nat", "-A", "OUTPUT",
+      "-p", "tcp", "!", "-d", "127.0.0.0/8",
+      "-j", "REDIRECT", "--to-ports", v4_port_str, nullptr};
+  const char *v6_args[] = {
+      "ip6tables", "-t", "nat", "-A", "OUTPUT",
+      "-p", "tcp", "!", "-d", "::1",
+      "-j", "REDIRECT", "--to-ports", v6_port_str, nullptr};
+
+  bool ok_v4 = run_iptables("/system/bin/iptables", "ipv4", v4_args);
+  // ip6tables nat may not be configured on every kernel; treat v6 as best
+  // effort.
+  bool ok_v6 = run_iptables("/system/bin/ip6tables", "ipv6", v6_args);
+  if (!ok_v6) {
+    std::fprintf(stderr,
+                 "scene-netnsctl: [proxy] ipv6 redirect unavailable; "
+                 "v6 outbound traffic will fail closed\n");
+  }
+  return ok_v4;
 }
 
 void pin_forever() {
@@ -684,21 +723,37 @@ void pin_forever() {
   write_endpoint_file(g_sock_path);
   write_pid_file();
 
-  // Start the in-netns transparent TCP proxy.
-  int proxy_listener = -1;
-  uint16_t proxy_port = start_proxy_listener(&proxy_listener);
-  write_proxy_port_file(proxy_port);
-  std::fprintf(stderr, "scene-netnsctl: [proxy] listening on 127.0.0.1:%u\n",
-               static_cast<unsigned>(proxy_port));
+  // Start the in-netns transparent TCP proxy: one v4 listener and one v6.
+  int v4_listener = -1;
+  int v6_listener = -1;
+  uint16_t v4_port = bind_listener(AF_INET, &v4_listener);
+  uint16_t v6_port = bind_listener(AF_INET6, &v6_listener);
+  std::fprintf(stderr, "scene-netnsctl: [proxy] v4 listener on 127.0.0.1:%u\n",
+               static_cast<unsigned>(v4_port));
+  std::fprintf(stderr, "scene-netnsctl: [proxy] v6 listener on [::1]:%u\n",
+               static_cast<unsigned>(v6_port));
 
-  pthread_t accept_tid;
+  // Plumb iptables nat OUTPUT inside the isolated netns. Any TCP connect
+  // (other than to loopback) is now redirected to our listener; the kernel
+  // remembers the original destination for SO_ORIGINAL_DST.
+  if (!install_redirect_rules(v4_port, v6_port)) {
+    die_msg("[proxy] failed to install ipv4 redirect rules");
+  }
+
   pthread_attr_t pattr;
   pthread_attr_init(&pattr);
   pthread_attr_setdetachstate(&pattr, PTHREAD_CREATE_DETACHED);
-  int *listener_arg = new int(proxy_listener);
-  if (pthread_create(&accept_tid, &pattr, proxy_acceptor, listener_arg) != 0) {
-    delete listener_arg;
-    die("[proxy] pthread_create acceptor");
+
+  pthread_t v4_tid, v6_tid;
+  auto *v4_arg = new AcceptArg{v4_listener, AF_INET};
+  if (pthread_create(&v4_tid, &pattr, proxy_acceptor, v4_arg) != 0) {
+    delete v4_arg;
+    die("[proxy] pthread_create v4");
+  }
+  auto *v6_arg = new AcceptArg{v6_listener, AF_INET6};
+  if (pthread_create(&v6_tid, &pattr, proxy_acceptor, v6_arg) != 0) {
+    delete v6_arg;
+    std::fprintf(stderr, "scene-netnsctl: [proxy] v6 acceptor not started\n");
   }
   pthread_attr_destroy(&pattr);
 
@@ -708,7 +763,6 @@ void pin_forever() {
     }
     unlink(kEndpointPath);
     unlink(kPidPath);
-    unlink(kProxyPortPath);
     _exit(0);
   });
 
@@ -769,20 +823,6 @@ void status() {
     char pid[64] {};
     if (std::fgets(pid, sizeof(pid), fp)) {
       std::printf("pinner_pid=%s", pid);
-    }
-    std::fclose(fp);
-  }
-
-  fp = std::fopen(kProxyPortPath, "r");
-  if (fp) {
-    char port[16] {};
-    if (std::fgets(port, sizeof(port), fp)) {
-      // strip trailing newline
-      size_t n = std::strlen(port);
-      while (n > 0 && (port[n - 1] == '\n' || port[n - 1] == '\r')) {
-        port[--n] = '\0';
-      }
-      std::printf("proxy_port=%s\n", port);
     }
     std::fclose(fp);
   }
