@@ -32,16 +32,16 @@ using zygisk::ServerSpecializeArgs;
 
 namespace {
 
-using scene_netns::kCmdFetchNetns;
-using scene_netns::kCmdHostConnect;
-using scene_netns::kConnectFlagNonblock;
 using scene_netns::kEndpointPath;
+using scene_netns::kProxyFamilyV4;
+using scene_netns::kProxyFamilyV6;
+using scene_netns::kProxyHandshakeSize;
+using scene_netns::kProxyHandshakeVersion;
+using scene_netns::kProxyPortPath;
+using scene_netns::kProxyStatusErr;
+using scene_netns::kProxyStatusOk;
 using scene_netns::kRunDir;
-using scene_netns::kStatusErr;
-using scene_netns::kStatusOk;
 using scene_netns::kUnixPathMax;
-using scene_netns::ProxyCommand;
-using scene_netns::ProxyStatus;
 
 constexpr const char *kTag = "SceneNetns";
 constexpr const char *kPackage = "com.omarea.vtools";
@@ -60,133 +60,6 @@ void loge(const char *fmt, ...) {
   va_start(ap, fmt);
   __android_log_vprint(ANDROID_LOG_ERROR, kTag, fmt, ap);
   va_end(ap);
-}
-
-// ---------------------------------------------------------------------------
-// Tiny IO helpers for AF_UNIX SOCK_STREAM.  These speak in plain byte buffers;
-// SCM_RIGHTS fd passing has its own helpers below.
-// ---------------------------------------------------------------------------
-
-bool write_full(int fd, const void *buf, size_t len) {
-  const char *p = static_cast<const char *>(buf);
-  while (len > 0) {
-    ssize_t n = send(fd, p, len, MSG_NOSIGNAL);
-    if (n < 0) {
-      if (errno == EINTR) continue;
-      return false;
-    }
-    if (n == 0) return false;
-    p += n;
-    len -= static_cast<size_t>(n);
-  }
-  return true;
-}
-
-bool read_full(int fd, void *buf, size_t len) {
-  char *p = static_cast<char *>(buf);
-  while (len > 0) {
-    ssize_t n = recv(fd, p, len, 0);
-    if (n < 0) {
-      if (errno == EINTR) continue;
-      return false;
-    }
-    if (n == 0) return false;
-    p += n;
-    len -= static_cast<size_t>(n);
-  }
-  return true;
-}
-
-bool write_be32(int fd, uint32_t v) {
-  uint32_t be = htonl(v);
-  return write_full(fd, &be, sizeof(be));
-}
-
-bool read_be32(int fd, uint32_t *out) {
-  uint32_t be = 0;
-  if (!read_full(fd, &be, sizeof(be))) return false;
-  *out = ntohl(be);
-  return true;
-}
-
-// Send `data_byte` plus an optional fd over SCM_RIGHTS.  If fd < 0, no fd is
-// transmitted (useful for error responses).
-bool send_msg_with_fd(int sock, uint8_t status, int fd, const void *trailer,
-                      size_t trailer_len) {
-  struct iovec iov[2];
-  iov[0].iov_base = &status;
-  iov[0].iov_len = sizeof(status);
-  size_t iovcnt = 1;
-  if (trailer && trailer_len > 0) {
-    iov[1].iov_base = const_cast<void *>(trailer);
-    iov[1].iov_len = trailer_len;
-    iovcnt = 2;
-  }
-
-  struct msghdr msg = {};
-  msg.msg_iov = iov;
-  msg.msg_iovlen = iovcnt;
-
-  alignas(struct cmsghdr) char control[CMSG_SPACE(sizeof(int))] = {};
-  if (fd >= 0) {
-    msg.msg_control = control;
-    msg.msg_controllen = sizeof(control);
-    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-    cmsg->cmsg_level = SOL_SOCKET;
-    cmsg->cmsg_type = SCM_RIGHTS;
-    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-    memcpy(CMSG_DATA(cmsg), &fd, sizeof(fd));
-  }
-
-  ssize_t n = sendmsg(sock, &msg, MSG_NOSIGNAL);
-  return n >= 0;
-}
-
-// Receive one status byte plus optionally an fd via SCM_RIGHTS.  On error
-// status, no fd is expected.  trailer (if non-null) gets exactly trailer_len
-// bytes after the status byte.  *out_fd is set to -1 if no fd was received.
-bool recv_msg_with_fd(int sock, uint8_t *out_status, int *out_fd,
-                      void *trailer, size_t trailer_len) {
-  *out_fd = -1;
-  uint8_t status = 0;
-  struct iovec iov[2];
-  iov[0].iov_base = &status;
-  iov[0].iov_len = sizeof(status);
-  size_t iovcnt = 1;
-  if (trailer && trailer_len > 0) {
-    iov[1].iov_base = trailer;
-    iov[1].iov_len = trailer_len;
-    iovcnt = 2;
-  }
-
-  struct msghdr msg = {};
-  msg.msg_iov = iov;
-  msg.msg_iovlen = iovcnt;
-  alignas(struct cmsghdr) char control[CMSG_SPACE(sizeof(int))] = {};
-  msg.msg_control = control;
-  msg.msg_controllen = sizeof(control);
-
-  ssize_t n = recvmsg(sock, &msg, MSG_CMSG_CLOEXEC);
-  if (n < 0) return false;
-  if (n < 1) return false;
-  *out_status = status;
-
-  for (struct cmsghdr *c = CMSG_FIRSTHDR(&msg); c != nullptr;
-       c = CMSG_NXTHDR(&msg, c)) {
-    if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS &&
-        c->cmsg_len == CMSG_LEN(sizeof(int))) {
-      memcpy(out_fd, CMSG_DATA(c), sizeof(*out_fd));
-      break;
-    }
-  }
-
-  if (trailer && trailer_len > 0) {
-    if (static_cast<size_t>(n) < 1 + trailer_len) {
-      // Trailer truncated; bail.  Consumer must treat as error.
-      return false;
-    }
-  }
-  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -225,31 +98,49 @@ int sys_setns(int fd, int nstype) {
 }
 
 // ---------------------------------------------------------------------------
-// Long-lived companion connection state, shared by all hooked threads.
+// Proxy port discovery + outbound redirect.
+//
+// The pinner publishes the in-netns transparent TCP proxy port to a small
+// world-readable file inside /dev/.15f1c4b9.  Any process that has entered
+// the isolated netns (i.e. our hooked target app) can read the port and
+// connect to 127.0.0.1:<port>, then send a handshake describing the original
+// destination.
 // ---------------------------------------------------------------------------
 
-struct ProxyState {
-  pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
-  int sock = -1;            // long-lived AF_UNIX SOCK_STREAM to companion
-  bool initialised = false; // true once setup attempt finished
-};
-
-ProxyState g_proxy;
-
-// Forward decl of the original libc connect.
+uint16_t g_proxy_port = 0;            // populated once; 0 means unavailable
 using connect_fn_t = int (*)(int, const struct sockaddr *, socklen_t);
 connect_fn_t g_real_connect = nullptr;
 
+bool read_proxy_port_once() {
+  if (g_proxy_port != 0) return true;
+  int fd = open(kProxyPortPath, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    loge("[hook] open proxy port file failed: %s", strerror(errno));
+    return false;
+  }
+  char buf[16] = {};
+  ssize_t n = read(fd, buf, sizeof(buf) - 1);
+  close(fd);
+  if (n <= 0) {
+    loge("[hook] proxy port file empty");
+    return false;
+  }
+  buf[n] = '\0';
+  unsigned long port = strtoul(buf, nullptr, 10);
+  if (port == 0 || port > 65535) {
+    loge("[hook] proxy port file invalid: %s", buf);
+    return false;
+  }
+  g_proxy_port = static_cast<uint16_t>(port);
+  return true;
+}
+
 bool is_loopback_v4(uint32_t ip_be) {
-  // 127.0.0.0/8 in any byte order representation.  The kernel sees ip_be in
-  // network byte order, so 0x7f is the high byte of the host-order address.
   return (ntohl(ip_be) & 0xff000000U) == 0x7f000000U;
 }
 
 bool is_loopback_v6(const struct in6_addr *a6) {
-  // ::1
   if (IN6_IS_ADDR_LOOPBACK(a6)) return true;
-  // v4-mapped loopback ::ffff:127.x.y.z
   if (IN6_IS_ADDR_V4MAPPED(a6)) {
     uint32_t ip_be;
     memcpy(&ip_be, &a6->s6_addr[12], sizeof(ip_be));
@@ -271,61 +162,55 @@ bool target_is_loopback(const struct sockaddr *sa, socklen_t len) {
   return false;
 }
 
-// Ask the companion for a freshly-connected socket living in host netns.
-// On success returns the new fd (caller owns it).  On failure returns -1 and
-// sets errno to whatever the companion reported.
-int request_host_connected_fd(int domain, int type, int protocol,
-                              const struct sockaddr *sa, socklen_t len,
-                              uint32_t flags) {
-  pthread_mutex_lock(&g_proxy.mu);
-  int sock = g_proxy.sock;
-  if (sock < 0) {
-    pthread_mutex_unlock(&g_proxy.mu);
-    errno = ENOTCONN;
-    return -1;
+bool build_handshake(const struct sockaddr *sa, socklen_t len,
+                     uint8_t out[kProxyHandshakeSize]) {
+  memset(out, 0, kProxyHandshakeSize);
+  out[0] = kProxyHandshakeVersion;
+  if (sa->sa_family == AF_INET && len >= static_cast<socklen_t>(sizeof(sockaddr_in))) {
+    const auto *in4 = reinterpret_cast<const sockaddr_in *>(sa);
+    out[1] = kProxyFamilyV4;
+    memcpy(out + 2, &in4->sin_port, sizeof(in4->sin_port));
+    memcpy(out + 4, &in4->sin_addr, sizeof(in4->sin_addr));
+    return true;
   }
-
-  uint8_t cmd = static_cast<uint8_t>(kCmdHostConnect);
-  bool ok = write_full(sock, &cmd, sizeof(cmd));
-  ok = ok && write_be32(sock, static_cast<uint32_t>(domain));
-  ok = ok && write_be32(sock, static_cast<uint32_t>(type));
-  ok = ok && write_be32(sock, static_cast<uint32_t>(protocol));
-  ok = ok && write_be32(sock, static_cast<uint32_t>(len));
-  ok = ok && write_full(sock, sa, len);
-  ok = ok && write_be32(sock, flags);
-  if (!ok) {
-    loge("[hook] companion request write failed: %s", strerror(errno));
-    pthread_mutex_unlock(&g_proxy.mu);
-    errno = EIO;
-    return -1;
+  if (sa->sa_family == AF_INET6 && len >= static_cast<socklen_t>(sizeof(sockaddr_in6))) {
+    const auto *in6 = reinterpret_cast<const sockaddr_in6 *>(sa);
+    out[1] = kProxyFamilyV6;
+    memcpy(out + 2, &in6->sin6_port, sizeof(in6->sin6_port));
+    memcpy(out + 4, &in6->sin6_addr, sizeof(in6->sin6_addr));
+    return true;
   }
+  return false;
+}
 
-  uint8_t status = 0;
-  int new_fd = -1;
-  uint32_t errno_be = 0;
-  // For both success and failure responses we tentatively read a 4-byte
-  // trailer, then interpret based on status.  Companion always writes
-  // exactly 5 bytes after the status byte either way, but for success the
-  // trailing 4 bytes are reserved (zero) so we keep the framing fixed.
-  char trailer[4] = {};
-  ok = recv_msg_with_fd(sock, &status, &new_fd, trailer, sizeof(trailer));
-  pthread_mutex_unlock(&g_proxy.mu);
-  if (!ok) {
-    loge("[hook] companion response read failed: %s", strerror(errno));
-    if (new_fd >= 0) close(new_fd);
-    errno = EIO;
-    return -1;
+bool write_full(int fd, const void *buf, size_t len) {
+  const char *p = static_cast<const char *>(buf);
+  while (len > 0) {
+    ssize_t n = send(fd, p, len, MSG_NOSIGNAL);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      return false;
+    }
+    if (n == 0) return false;
+    p += n;
+    len -= static_cast<size_t>(n);
   }
+  return true;
+}
 
-  if (status == kStatusOk && new_fd >= 0) {
-    return new_fd;
+bool read_full(int fd, void *buf, size_t len) {
+  char *p = static_cast<char *>(buf);
+  while (len > 0) {
+    ssize_t n = recv(fd, p, len, 0);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      return false;
+    }
+    if (n == 0) return false;
+    p += n;
+    len -= static_cast<size_t>(n);
   }
-
-  if (new_fd >= 0) close(new_fd);
-  memcpy(&errno_be, trailer, sizeof(errno_be));
-  int err = static_cast<int>(ntohl(errno_be));
-  errno = err > 0 ? err : ECONNREFUSED;
-  return -1;
+  return true;
 }
 
 extern "C" int my_connect(int fd, const struct sockaddr *sa, socklen_t len) {
@@ -335,67 +220,81 @@ extern "C" int my_connect(int fd, const struct sockaddr *sa, socklen_t len) {
     return -1;
   }
 
-  // Loopback / non-IP: stay in isolated netns and use the real syscall.
   if (sa->sa_family != AF_INET && sa->sa_family != AF_INET6) {
     return g_real_connect(fd, sa, len);
   }
   if (target_is_loopback(sa, len)) {
     return g_real_connect(fd, sa, len);
   }
-
-  // External target: fetch a connected fd from the host-netns companion and
-  // dup it onto the caller-supplied fd.  This way the caller's fd number stays
-  // valid for any selectors/epoll registrations they may have set up.
-  int sock_type = 0;
-  int protocol = 0;
-  socklen_t opt_len = sizeof(sock_type);
-  if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &sock_type, &opt_len) != 0) {
-    sock_type = SOCK_STREAM;
-  }
-  // Bionic exposes SO_PROTOCOL on recent kernels; if it fails we let the
-  // companion infer 0 (any).
-#ifdef SO_PROTOCOL
-  opt_len = sizeof(protocol);
-  if (getsockopt(fd, SOL_SOCKET, SO_PROTOCOL, &protocol, &opt_len) != 0) {
-    protocol = 0;
-  }
-#endif
-
-  int orig_flags = fcntl(fd, F_GETFL);
-  if (orig_flags < 0) orig_flags = 0;
-  uint32_t proxy_flags = 0;
-  if (orig_flags & O_NONBLOCK) proxy_flags |= kConnectFlagNonblock;
-
-  int host_fd = request_host_connected_fd(sa->sa_family, sock_type, protocol,
-                                          sa, len, proxy_flags);
-  if (host_fd < 0) {
+  if (g_proxy_port == 0 && !read_proxy_port_once()) {
+    // No proxy means no outbound: reproduce ECONNREFUSED so callers see a
+    // deterministic failure rather than hanging.
+    errno = ENETUNREACH;
     return -1;
   }
 
-  // Replace caller fd with the host-connected one without changing fd number.
-  if (dup2(host_fd, fd) < 0) {
+  uint8_t handshake[kProxyHandshakeSize];
+  if (!build_handshake(sa, len, handshake)) {
+    errno = EAFNOSUPPORT;
+    return -1;
+  }
+
+  // Honour caller-imposed O_NONBLOCK by temporarily clearing it; the proxy
+  // handshake assumes a blocking-style flow.  We restore the flag before
+  // returning so the app's downstream usage is unaffected.
+  int orig_flags = fcntl(fd, F_GETFL);
+  bool was_nonblock = (orig_flags >= 0) && (orig_flags & O_NONBLOCK);
+  if (was_nonblock) {
+    fcntl(fd, F_SETFL, orig_flags & ~O_NONBLOCK);
+  }
+
+  // Connect to the in-netns proxy listener using the original caller fd.
+  sockaddr_in proxy_addr {};
+  proxy_addr.sin_family = AF_INET;
+  proxy_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  proxy_addr.sin_port = htons(g_proxy_port);
+  int rc = g_real_connect(fd, reinterpret_cast<sockaddr *>(&proxy_addr),
+                          sizeof(proxy_addr));
+  if (rc != 0) {
     int saved = errno;
-    close(host_fd);
+    if (was_nonblock) fcntl(fd, F_SETFL, orig_flags);
     errno = saved;
     return -1;
   }
-  close(host_fd);
 
-  // Restore O_NONBLOCK if the caller had it set (dup2 preserves the open file
-  // description's flags from host_fd, which we always opened in blocking
-  // mode).  All other flags (O_CLOEXEC etc.) live on the fd flags side and
-  // were already set on the original fd.
-  if (orig_flags & O_NONBLOCK) {
-    int cur = fcntl(fd, F_GETFL);
-    if (cur >= 0 && !(cur & O_NONBLOCK)) {
-      fcntl(fd, F_SETFL, cur | O_NONBLOCK);
-    }
+  if (!write_full(fd, handshake, sizeof(handshake))) {
+    int saved = errno;
+    if (was_nonblock) fcntl(fd, F_SETFL, orig_flags);
+    errno = saved ? saved : EIO;
+    return -1;
   }
+
+  uint8_t status = 0;
+  if (!read_full(fd, &status, sizeof(status))) {
+    if (was_nonblock) fcntl(fd, F_SETFL, orig_flags);
+    errno = EIO;
+    return -1;
+  }
+  if (status != kProxyStatusOk) {
+    uint32_t err_be = 0;
+    if (read_full(fd, &err_be, sizeof(err_be))) {
+      errno = static_cast<int>(ntohl(err_be));
+      if (errno <= 0) errno = ECONNREFUSED;
+    } else {
+      errno = ECONNREFUSED;
+    }
+    if (was_nonblock) fcntl(fd, F_SETFL, orig_flags);
+    return -1;
+  }
+
+  if (was_nonblock) fcntl(fd, F_SETFL, orig_flags);
   return 0;
 }
 
 // ---------------------------------------------------------------------------
-// PLT hook installation: hook libc's connect() across every loaded ELF.
+// PLT hook installation: hook libc's connect() across every loaded ELF that
+// allows it.  We register and commit each ELF in isolation so that a single
+// unhookable mapping does not roll back the whole batch.
 // ---------------------------------------------------------------------------
 
 struct MapEntry {
@@ -414,7 +313,6 @@ std::vector<MapEntry> collect_executable_mappings() {
   char *line = nullptr;
   size_t cap = 0;
   while (getline(&line, &cap, fp) > 0) {
-    // Format: addr-addr perms offset dev inode path
     char perms[8] = {};
     unsigned long offset = 0;
     unsigned int dev_major = 0, dev_minor = 0;
@@ -424,14 +322,13 @@ std::vector<MapEntry> collect_executable_mappings() {
                          perms, &offset, &dev_major, &dev_minor, &inode_val,
                          &path_off);
     if (matched < 5) continue;
-    if (perms[2] != 'x') continue;        // need executable
-    if (inode_val == 0) continue;         // anonymous mapping
+    if (perms[2] != 'x') continue;
+    if (inode_val == 0) continue;
     const char *path = line + path_off;
     while (*path == ' ' || *path == '\t') ++path;
     if (*path == '\0' || *path == '\n') continue;
-    if (*path == '[') continue;           // [vdso] etc.
+    if (*path == '[') continue;
 
-    // Strip trailing newline
     std::string p = path;
     while (!p.empty() && (p.back() == '\n' || p.back() == '\r')) p.pop_back();
 
@@ -445,15 +342,19 @@ std::vector<MapEntry> collect_executable_mappings() {
   return result;
 }
 
-// Hook libc connect() in every loaded ELF that has a PLT entry for it.
-// pltHookRegister tolerates missing symbols (they just become no-ops on
-// commit), so we register against every executable mapping unconditionally.
-bool install_connect_hooks(Api *api) {
-  if (!api) return false;
+bool path_should_be_hooked(const std::string &path) {
+  // Limit ourselves to shared libraries so we don't try to rewrite the GOT of
+  // executables (app_process etc.).
+  if (path.find(".so") == std::string::npos) return false;
+  // Skip our own library; we don't have a connect PLT entry (or if we did,
+  // hooking yourself can produce surprising recursion).
+  if (path.find("scene_netns_zygisk") != std::string::npos) return false;
+  return true;
+}
 
-  // Stash the real implementation up-front via dlsym so that g_real_connect is
-  // populated even before any hooked library calls connect.  pltHookRegister
-  // will also hand us back the original via oldFunc, but only after commit.
+size_t install_connect_hooks(Api *api) {
+  if (!api) return 0;
+
   void *libc = dlopen("libc.so", RTLD_NOW | RTLD_NOLOAD);
   if (libc) {
     g_real_connect = reinterpret_cast<connect_fn_t>(dlsym(libc, "connect"));
@@ -465,38 +366,34 @@ bool install_connect_hooks(Api *api) {
   }
   if (!g_real_connect) {
     loge("[hook] failed to resolve real connect()");
-    return false;
+    return 0;
   }
 
   auto mappings = collect_executable_mappings();
-  size_t registered = 0;
+  size_t committed = 0;
+  size_t attempted = 0;
   for (const auto &m : mappings) {
-    // Skip the dynamic linker / vdso-ish things; hooking them is pointless
-    // and may crash.  Anything in /system/bin that's a binary (not .so) is
-    // also unlikely to ever call connect().
-    if (m.path.find(".so") == std::string::npos) continue;
-
+    if (!path_should_be_hooked(m.path)) continue;
+    ++attempted;
     void *prev = nullptr;
     api->pltHookRegister(m.dev, m.inode, "connect",
                          reinterpret_cast<void *>(&my_connect), &prev);
-    ++registered;
+    // Commit per-ELF: a failure on one library no longer rolls back others.
+    if (api->pltHookCommit()) {
+      ++committed;
+    } else {
+      // pltHookCommit failure is silent in libc; log the path to aid debugging
+      // but keep going.
+      loge("[hook] commit failed for %s", m.path.c_str());
+    }
   }
-  if (registered == 0) {
-    loge("[hook] no eligible mappings for connect hook");
-    return false;
-  }
-
-  if (!api->pltHookCommit()) {
-    loge("[hook] pltHookCommit failed");
-    return false;
-  }
-  logi("[hook] connect() PLT hook installed across %zu mappings",
-       registered);
-  return true;
+  logi("[hook] connect() PLT hook committed for %zu of %zu ELFs",
+       committed, attempted);
+  return committed;
 }
 
 // ---------------------------------------------------------------------------
-// Pinner endpoint discovery (used by the companion for FETCH_NETNS).
+// Pinner endpoint discovery (used by the companion for fetching the netns).
 // ---------------------------------------------------------------------------
 
 bool path_is_in_run_dir(const char *path) {
@@ -570,31 +467,60 @@ void fill_sockaddr(sockaddr_un *addr, const char *path) {
   snprintf(addr->sun_path, sizeof(addr->sun_path), "%s", path);
 }
 
-int recv_single_fd(int sock) {
-  uint8_t status = 0;
-  int fd = -1;
-  char trailer[4] = {};
-  if (!recv_msg_with_fd(sock, &status, &fd, trailer, 0)) return -1;
-  if (status != kStatusOk || fd < 0) {
-    if (fd >= 0) close(fd);
+int recv_fd_msg(int sock) {
+  char data = 0;
+  iovec iov = {};
+  iov.iov_base = &data;
+  iov.iov_len = sizeof(data);
+  alignas(cmsghdr) char control[CMSG_SPACE(sizeof(int))] = {};
+  msghdr msg = {};
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+  msg.msg_control = control;
+  msg.msg_controllen = sizeof(control);
+
+  if (recvmsg(sock, &msg, MSG_CMSG_CLOEXEC) < 0) {
     return -1;
   }
+  cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+  if (!cmsg || cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS ||
+      cmsg->cmsg_len != CMSG_LEN(sizeof(int))) {
+    return -1;
+  }
+  int fd = -1;
+  memcpy(&fd, CMSG_DATA(cmsg), sizeof(fd));
   return fd;
 }
 
-int request_pinner_netns_fd() {
+void send_fd_msg(int sock, int fd) {
+  char data = 'N';
+  iovec iov = {};
+  iov.iov_base = &data;
+  iov.iov_len = sizeof(data);
+  alignas(cmsghdr) char control[CMSG_SPACE(sizeof(int))] = {};
+  msghdr msg = {};
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+  msg.msg_control = control;
+  msg.msg_controllen = sizeof(control);
+
+  cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+  cmsg->cmsg_level = SOL_SOCKET;
+  cmsg->cmsg_type = SCM_RIGHTS;
+  cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+  memcpy(CMSG_DATA(cmsg), &fd, sizeof(fd));
+  msg.msg_controllen = CMSG_SPACE(sizeof(int));
+  sendmsg(sock, &msg, MSG_NOSIGNAL);
+}
+
+int request_netns_fd_from_pinner() {
   char sock_path[kUnixPathMax] = {};
   if (!read_endpoint_path(sock_path, sizeof(sock_path)) ||
       !private_socket_exists(sock_path)) {
     return -1;
   }
-
   int sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-  if (sock < 0) {
-    loge("[companion] socket failed: %s", strerror(errno));
-    return -1;
-  }
-
+  if (sock < 0) return -1;
   sockaddr_un addr = {};
   fill_sockaddr(&addr, sock_path);
   if (connect(sock, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
@@ -602,153 +528,39 @@ int request_pinner_netns_fd() {
     close(sock);
     return -1;
   }
-
-  // The legacy pinner protocol just writes a single-byte 'N' plus SCM_RIGHTS
-  // fd as soon as the client connects.  No request bytes from us.
-  int fd = recv_single_fd(sock);
+  int ns_fd = recv_fd_msg(sock);
   close(sock);
-  return fd;
+  return ns_fd;
 }
 
-// ---------------------------------------------------------------------------
-// Companion: command loop.
-// ---------------------------------------------------------------------------
-
-void handle_fetch_netns(int client) {
-  int ns_fd = request_pinner_netns_fd();
-  if (ns_fd < 0) {
-    char trailer[4] = {};
-    uint32_t err_be = htonl(ECONNREFUSED);
-    memcpy(trailer, &err_be, sizeof(err_be));
-    send_msg_with_fd(client, kStatusErr, -1, trailer, sizeof(trailer));
-    return;
-  }
-  send_msg_with_fd(client, kStatusOk, ns_fd, nullptr, 0);
-  close(ns_fd);
-}
-
-void handle_host_connect(int client) {
-  uint32_t domain = 0, type = 0, protocol = 0, addr_len = 0, flags = 0;
-  if (!read_be32(client, &domain) || !read_be32(client, &type) ||
-      !read_be32(client, &protocol) || !read_be32(client, &addr_len)) {
-    return;
-  }
-  if (addr_len == 0 || addr_len > sizeof(sockaddr_storage)) {
-    // Drain remaining bytes if any then bail.
-    return;
-  }
-  std::vector<char> addr_buf(addr_len);
-  if (!read_full(client, addr_buf.data(), addr_len)) return;
-  if (!read_be32(client, &flags)) return;
-
-  // Always create a blocking socket on our side.  The caller is free to set
-  // O_NONBLOCK on the returned fd via fcntl in their own process.
-  int new_type = static_cast<int>(type);
-  // Strip non-blocking/cloexec request bits from the type so that the
-  // connect below is deterministic.  Bionic's socket() copes with these,
-  // but we want full control.
-  new_type &= ~SOCK_NONBLOCK;
-  new_type |= SOCK_CLOEXEC;
-
-  int s = socket(static_cast<int>(domain), new_type,
-                 static_cast<int>(protocol));
-  if (s < 0) {
-    int err = errno;
-    char trailer[4] = {};
-    uint32_t err_be = htonl(err > 0 ? err : EAFNOSUPPORT);
-    memcpy(trailer, &err_be, sizeof(err_be));
-    send_msg_with_fd(client, kStatusErr, -1, trailer, sizeof(trailer));
-    return;
-  }
-
-  if (connect(s, reinterpret_cast<sockaddr *>(addr_buf.data()),
-              static_cast<socklen_t>(addr_len)) != 0) {
-    int err = errno;
-    close(s);
-    char trailer[4] = {};
-    uint32_t err_be = htonl(err > 0 ? err : ECONNREFUSED);
-    memcpy(trailer, &err_be, sizeof(err_be));
-    send_msg_with_fd(client, kStatusErr, -1, trailer, sizeof(trailer));
-    return;
-  }
-
-  // Suppress the unused-flag warning; flags is currently informational only.
-  (void)flags;
-
-  char trailer[4] = {};  // reserved zeros for protocol symmetry
-  send_msg_with_fd(client, kStatusOk, s, trailer, sizeof(trailer));
-  close(s);
-}
-
+// Companion is intentionally minimal: its sole job is to fetch the pinned
+// netns fd (which only root can open) and hand it to the caller.  The
+// long-lived proxy work happens entirely inside the pinner.
 void companion_handler(int client) {
-  // Loop until peer closes the connection.  Each iteration consumes one
-  // command byte and dispatches.  Errors bail the loop.
-  for (;;) {
-    uint8_t cmd = 0;
-    if (!read_full(client, &cmd, sizeof(cmd))) break;
-
-    switch (cmd) {
-      case kCmdFetchNetns:
-        handle_fetch_netns(client);
-        break;
-      case kCmdHostConnect:
-        handle_host_connect(client);
-        break;
-      default:
-        loge("[companion] unknown command: %u", cmd);
-        // Don't try to parse trailing bytes; framing is now lost.
-        close(client);
-        return;
-    }
+  int ns_fd = request_netns_fd_from_pinner();
+  if (ns_fd < 0) {
+    close(client);
+    return;
   }
+  send_fd_msg(client, ns_fd);
+  close(ns_fd);
   close(client);
 }
 
-// ---------------------------------------------------------------------------
-// Zygisk module: connects to companion, receives ns fd, setns, installs PLT
-// hooks for connect, then keeps the proxy socket alive for the app's lifetime.
-// ---------------------------------------------------------------------------
-
-bool fetch_netns_and_keep_proxy(Api *api, int *out_ns_fd) {
+bool fetch_netns_fd(Api *api, int *out_ns_fd) {
   *out_ns_fd = -1;
   int sock = api->connectCompanion();
   if (sock < 0) {
     loge("[zygisk] connect companion failed");
     return false;
   }
-
-  uint8_t cmd = static_cast<uint8_t>(kCmdFetchNetns);
-  if (!write_full(sock, &cmd, sizeof(cmd))) {
-    loge("[zygisk] send FETCH_NETNS failed: %s", strerror(errno));
-    close(sock);
+  int ns_fd = recv_fd_msg(sock);
+  close(sock);
+  if (ns_fd < 0) {
+    loge("[zygisk] companion did not return a netns fd");
     return false;
   }
-
-  uint8_t status = 0;
-  int ns_fd = -1;
-  if (!recv_msg_with_fd(sock, &status, &ns_fd, nullptr, 0)) {
-    loge("[zygisk] recv FETCH_NETNS reply failed: %s", strerror(errno));
-    close(sock);
-    return false;
-  }
-  if (status != kStatusOk || ns_fd < 0) {
-    loge("[zygisk] companion declined FETCH_NETNS (status=%u)", status);
-    if (ns_fd >= 0) close(ns_fd);
-    close(sock);
-    return false;
-  }
-
   *out_ns_fd = ns_fd;
-
-  pthread_mutex_lock(&g_proxy.mu);
-  g_proxy.sock = sock;
-  g_proxy.initialised = true;
-  pthread_mutex_unlock(&g_proxy.mu);
-
-  // Tell zygote to leave our long-lived socket alone during specialization.
-  if (!api->exemptFd(sock)) {
-    loge("[zygisk] exemptFd(proxy_sock) failed; socket may be closed by zygote");
-  }
   return true;
 }
 
@@ -780,17 +592,13 @@ class SceneNetnsModule : public zygisk::ModuleBase {
     if (!is_scene_process(env, args->nice_name, args->app_data_dir,
                           nice_name, sizeof(nice_name),
                           app_data_dir, sizeof(app_data_dir))) {
-      // Non-Scene process: safe to be unloaded once specialize finishes.
       api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
       return;
     }
 
     int ns_fd = -1;
-    if (!fetch_netns_and_keep_proxy(api, &ns_fd)) {
-      loge("[zygisk] failed to acquire netns/proxy: %s", nice_name);
-      // Without proxy we cannot safely enter the netns: that would break
-      // outbound connectivity entirely.  Fall back to leaving the process
-      // in host netns, which is the same as not having the module installed.
+    if (!fetch_netns_fd(api, &ns_fd)) {
+      loge("[zygisk] failed to acquire netns: %s", nice_name);
       api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
       return;
     }
@@ -798,32 +606,32 @@ class SceneNetnsModule : public zygisk::ModuleBase {
     if (sys_setns(ns_fd, CLONE_NEWNET) != 0) {
       loge("[zygisk] setns failed: %s", strerror(errno));
       close(ns_fd);
-      pthread_mutex_lock(&g_proxy.mu);
-      if (g_proxy.sock >= 0) {
-        close(g_proxy.sock);
-        g_proxy.sock = -1;
-      }
-      pthread_mutex_unlock(&g_proxy.mu);
       api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
       return;
     }
     close(ns_fd);
 
-    if (!install_connect_hooks(api)) {
-      loge("[zygisk] PLT hook installation failed; outbound traffic will fail");
-      // Note: we deliberately do NOT request DLCLOSE here, because a partial
-      // install may have already swapped some PLT entries.  Unloading would
-      // crash the app on the next external connect().
-      prepend_path_for_su_wrapper();
-      return;
+    // Cache the proxy port now that we are inside the isolated netns.  This
+    // is just a regular file read (no SELinux issue), but doing it once here
+    // avoids per-connect file IO on the hot path.
+    if (!read_proxy_port_once()) {
+      loge("[zygisk] proxy port unknown; outbound traffic will fail");
+      // Continue: install hooks anyway so my_connect at least returns a
+      // deterministic ENETUNREACH instead of hanging.
     }
 
+    size_t hooked = install_connect_hooks(api);
     prepend_path_for_su_wrapper();
-    // Important: do NOT call setOption(DLCLOSE_MODULE_LIBRARY) once PLT hooks
-    // are live.  Our my_connect would be torn out from under the app.
 
-    logi("[zygisk] Scene process isolated with proxy: nice_name=%s app_data_dir=%s",
-         nice_name, app_data_dir);
+    if (hooked == 0) {
+      loge("[zygisk] no PLT hooks installed; outbound traffic will fail");
+    }
+    // Important: do NOT request DLCLOSE_MODULE_LIBRARY here.  Our my_connect
+    // and read_proxy_port_once must remain mapped for the lifetime of the
+    // process now that PLT entries point into us.
+
+    logi("[zygisk] Scene process isolated: nice_name=%s app_data_dir=%s hooked=%zu",
+         nice_name, app_data_dir, hooked);
   }
 
   void postAppSpecialize(const AppSpecializeArgs *) override {}

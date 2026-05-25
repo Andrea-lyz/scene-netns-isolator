@@ -1,12 +1,35 @@
 // SPDX-License-Identifier: GPL-3.0
 //
-// Wire protocol between the Zygisk module (in target app process) and the
-// root companion process. The companion runs in the host network namespace
-// and lends out fully-connected sockets so the isolated app process can talk
-// to the outside world without leaving its own netns.
+// Wire protocol between the Zygisk module (running inside the isolated
+// network namespace as the target app process) and the pinner's transparent
+// TCP proxy listener (also living in the isolated netns, but with a thread
+// holding the host netns fd so it can dial out on behalf of the app).
 //
-// Protocol is request/response over a single long-lived AF_UNIX SOCK_STREAM.
-// Multi-threaded callers must serialise access to that socket.
+// The app side connects via plain TCP to 127.0.0.1:<proxy_port>, then sends a
+// fixed-format handshake describing the original destination.  The pinner
+// reads the handshake, switches to host netns, dials the destination, and
+// starts splicing bytes between the two sides.
+//
+// All multi-byte integers are network byte order.  The handshake is exactly
+// 28 bytes regardless of address family so the pinner can always read it
+// with a single recv loop without first inspecting the family byte.
+//
+//     offset   size   field
+//     0        1      version (currently 1)
+//     1        1      family  (4 = AF_INET, 6 = AF_INET6)
+//     2        2      port    (network byte order, copied from sockaddr)
+//     4        24     address bytes (sockaddr_in.sin_addr lives in [4..8],
+//                     sockaddr_in6.sin6_addr lives in [4..20], remainder
+//                     is unused/zero)
+//
+// After the handshake the proxy responds with a single status byte:
+//   'N' = success, splicing has begun
+//   'E' = failure, errno follows as 4-byte network-order integer, then the
+//         proxy closes the connection.
+//
+// On failure the app's connect() emulation must propagate that errno back to
+// the caller.  On success the app's connect() returns 0 and the app then
+// reads/writes its TLS records on the same fd as if it were the real peer.
 
 #pragma once
 
@@ -14,45 +37,11 @@
 
 namespace scene_netns {
 
-// Command identifiers. Sent from the app side to the companion as the first
-// byte of every request.
-enum ProxyCommand : uint8_t {
-    // No payload. Companion responds with SCM_RIGHTS carrying the pinned
-    // network namespace fd, plus a single status byte (kStatusOk).
-    kCmdFetchNetns = 0,
-
-    // Payload after the command byte:
-    //   int32_t domain     (network byte order)
-    //   int32_t type       (network byte order)
-    //   int32_t protocol   (network byte order)
-    //   int32_t addr_len   (network byte order)
-    //   uint8_t addr[addr_len]   (raw sockaddr bytes from the caller)
-    //   int32_t flags      (network byte order, application-defined)
-    //
-    // flags bit 0: O_NONBLOCK on the original fd (informational; companion
-    //              currently always performs a blocking connect and lets
-    //              the caller handle non-blocking semantics by setting the
-    //              flag back on the returned fd).
-    //
-    // Response on success:
-    //   uint8_t  status    = kStatusOk
-    //   SCM_RIGHTS fd      (already-connected socket living in host netns)
-    //
-    // Response on failure:
-    //   uint8_t  status    = kStatusErr
-    //   int32_t  errno_val (network byte order)
-    kCmdHostConnect = 1,
-};
-
-// Status byte that prefixes every response.
-enum ProxyStatus : uint8_t {
-    kStatusOk  = 'N',
-    kStatusErr = 'E',
-};
-
-// Bit flags for kCmdHostConnect.flags.
-enum ProxyConnectFlag : uint32_t {
-    kConnectFlagNonblock = 1u << 0,
-};
+constexpr uint8_t kProxyHandshakeVersion = 1;
+constexpr uint8_t kProxyFamilyV4 = 4;
+constexpr uint8_t kProxyFamilyV6 = 6;
+constexpr std::size_t kProxyHandshakeSize = 28;
+constexpr uint8_t kProxyStatusOk = 'N';
+constexpr uint8_t kProxyStatusErr = 'E';
 
 }  // namespace scene_netns

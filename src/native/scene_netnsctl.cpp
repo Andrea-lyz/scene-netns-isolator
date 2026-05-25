@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0
 #include <arpa/inet.h>
 #include <cerrno>
 #include <cstdint>
@@ -8,6 +9,9 @@
 #include <ctime>
 #include <fcntl.h>
 #include <linux/if.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <pthread.h>
 #include <sched.h>
 #include <string>
 #include <sys/ioctl.h>
@@ -18,17 +22,28 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include "../common/proxy_protocol.h"
 #include "../common/runtime_paths.h"
 
 namespace {
 
 using scene_netns::kEndpointPath;
 using scene_netns::kPidPath;
+using scene_netns::kProxyFamilyV4;
+using scene_netns::kProxyFamilyV6;
+using scene_netns::kProxyHandshakeSize;
+using scene_netns::kProxyHandshakeVersion;
+using scene_netns::kProxyPortPath;
+using scene_netns::kProxyStatusErr;
+using scene_netns::kProxyStatusOk;
 using scene_netns::kRunDir;
 using scene_netns::kUnixPathMax;
 
 constexpr const char *kDefaultShell = "/system/bin/sh";
+
 char g_sock_path[kUnixPathMax] = {};
+int g_host_ns_fd = -1;        // captured before unshare(): pinner's original netns
+int g_isolated_ns_fd = -1;    // captured after unshare(): the new isolated netns
 
 void die(const char *message) {
   std::fprintf(stderr, "scene-netnsctl: %s: %s\n", message, std::strerror(errno));
@@ -168,12 +183,16 @@ void write_pid_file() {
   chmod(kPidPath, 0600);
 }
 
-int open_current_netns() {
-  int fd = open("/proc/self/ns/net", O_RDONLY | O_CLOEXEC);
+int open_netns(const char *path) {
+  int fd = open(path, O_RDONLY | O_CLOEXEC);
   if (fd < 0) {
-    die("[pinner] open /proc/self/ns/net");
+    die("[pinner] open netns");
   }
   return fd;
+}
+
+int open_current_netns() {
+  return open_netns("/proc/self/ns/net");
 }
 
 void fill_sockaddr(sockaddr_un *addr, const char *path) {
@@ -355,6 +374,26 @@ void write_endpoint_file(const char *sock_path) {
   chmod(kEndpointPath, 0600);
 }
 
+void write_proxy_port_file(uint16_t port) {
+  // World-readable: any process inside the isolated netns must be able to
+  // discover the proxy port without needing privileged IPC.  The data leaked
+  // is just a port number, which is meaningless outside the isolated netns.
+  int fd = open(kProxyPortPath, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0644);
+  if (fd < 0) {
+    die("[pinner] open proxy port file");
+  }
+  char buf[16];
+  int n = std::snprintf(buf, sizeof(buf), "%u\n", static_cast<unsigned>(port));
+  if (write(fd, buf, n) != n) {
+    int saved = errno;
+    close(fd);
+    errno = saved;
+    die("[pinner] write proxy port file");
+  }
+  close(fd);
+  chmod(kProxyPortPath, 0644);
+}
+
 void cleanup_stale_endpoint() {
   char stale_path[kUnixPathMax] {};
   if (read_endpoint_path(stale_path, sizeof(stale_path), true)) {
@@ -362,17 +401,270 @@ void cleanup_stale_endpoint() {
   }
   unlink(kEndpointPath);
   unlink(kPidPath);
+  unlink(kProxyPortPath);
+}
+
+// ---------------------------------------------------------------------------
+// Transparent TCP proxy living inside the isolated netns.
+//
+// When the Zygisk module wants to reach the public internet it pretends to
+// connect() to its real target but is silently redirected (in user space, via
+// PLT hooks) to 127.0.0.1:<proxy_port> in the isolated netns.  It then writes
+// a fixed-size handshake describing the original destination.  The proxy
+// reads the handshake, dials the target from the host netns, replies with
+// the status byte, and pipes bytes between the two halves until either side
+// closes.
+// ---------------------------------------------------------------------------
+
+bool read_full_blocking(int fd, void *buf, size_t len) {
+  uint8_t *p = static_cast<uint8_t *>(buf);
+  while (len > 0) {
+    ssize_t n = recv(fd, p, len, 0);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      return false;
+    }
+    if (n == 0) return false;
+    p += n;
+    len -= static_cast<size_t>(n);
+  }
+  return true;
+}
+
+bool write_full_blocking(int fd, const void *buf, size_t len) {
+  const uint8_t *p = static_cast<const uint8_t *>(buf);
+  while (len > 0) {
+    ssize_t n = send(fd, p, len, MSG_NOSIGNAL);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      return false;
+    }
+    if (n == 0) return false;
+    p += n;
+    len -= static_cast<size_t>(n);
+  }
+  return true;
+}
+
+void send_proxy_error(int client_fd, int err) {
+  uint8_t status = kProxyStatusErr;
+  uint32_t err_be = htonl(err > 0 ? static_cast<uint32_t>(err)
+                                  : static_cast<uint32_t>(ECONNREFUSED));
+  write_full_blocking(client_fd, &status, sizeof(status));
+  write_full_blocking(client_fd, &err_be, sizeof(err_be));
+}
+
+void splice_loop(int a, int b) {
+  // Half-duplex shutdown: when one side closes for read we shutdown(write) on
+  // the other.  Connection is fully torn down once both directions are done.
+  bool a_to_b_open = true;
+  bool b_to_a_open = true;
+  uint8_t buf[16384];
+
+  pollfd pfds[2];
+  while (a_to_b_open || b_to_a_open) {
+    int n = 0;
+    if (a_to_b_open) {
+      pfds[n].fd = a;
+      pfds[n].events = POLLIN;
+      ++n;
+    }
+    if (b_to_a_open) {
+      pfds[n].fd = b;
+      pfds[n].events = POLLIN;
+      ++n;
+    }
+    int rv = poll(pfds, n, -1);
+    if (rv < 0) {
+      if (errno == EINTR) continue;
+      break;
+    }
+    for (int i = 0; i < n; ++i) {
+      if (!(pfds[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+      int from = pfds[i].fd;
+      int to = (from == a) ? b : a;
+      bool *side_open = (from == a) ? &a_to_b_open : &b_to_a_open;
+      ssize_t r = recv(from, buf, sizeof(buf), 0);
+      if (r > 0) {
+        if (!write_full_blocking(to, buf, static_cast<size_t>(r))) {
+          a_to_b_open = false;
+          b_to_a_open = false;
+        }
+      } else if (r == 0 || (r < 0 && errno != EINTR)) {
+        *side_open = false;
+        shutdown(to, SHUT_WR);
+      }
+    }
+  }
+}
+
+struct ProxyJob {
+  int client_fd;
+};
+
+void *proxy_worker(void *arg) {
+  ProxyJob *job = static_cast<ProxyJob *>(arg);
+  int client = job->client_fd;
+  delete job;
+
+  uint8_t handshake[kProxyHandshakeSize] = {};
+  if (!read_full_blocking(client, handshake, sizeof(handshake))) {
+    close(client);
+    return nullptr;
+  }
+  if (handshake[0] != kProxyHandshakeVersion) {
+    send_proxy_error(client, EPROTO);
+    close(client);
+    return nullptr;
+  }
+
+  uint8_t family = handshake[1];
+  uint16_t port_be = 0;
+  std::memcpy(&port_be, handshake + 2, sizeof(port_be));
+
+  // Switch this thread into host netns to make the outbound connection.
+  if (sys_setns(g_host_ns_fd, CLONE_NEWNET) != 0) {
+    int err = errno;
+    std::fprintf(stderr,
+                 "scene-netnsctl: [proxy] setns(host) failed: %s\n",
+                 std::strerror(err));
+    send_proxy_error(client, err);
+    close(client);
+    return nullptr;
+  }
+
+  int upstream = -1;
+  int connect_err = 0;
+  if (family == kProxyFamilyV4) {
+    sockaddr_in dst {};
+    dst.sin_family = AF_INET;
+    dst.sin_port = port_be;
+    std::memcpy(&dst.sin_addr, handshake + 4, sizeof(dst.sin_addr));
+    upstream = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (upstream < 0) {
+      connect_err = errno;
+    } else if (connect(upstream, reinterpret_cast<sockaddr *>(&dst),
+                       sizeof(dst)) != 0) {
+      connect_err = errno;
+      close(upstream);
+      upstream = -1;
+    }
+  } else if (family == kProxyFamilyV6) {
+    sockaddr_in6 dst {};
+    dst.sin6_family = AF_INET6;
+    dst.sin6_port = port_be;
+    std::memcpy(&dst.sin6_addr, handshake + 4, sizeof(dst.sin6_addr));
+    upstream = socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (upstream < 0) {
+      connect_err = errno;
+    } else if (connect(upstream, reinterpret_cast<sockaddr *>(&dst),
+                       sizeof(dst)) != 0) {
+      connect_err = errno;
+      close(upstream);
+      upstream = -1;
+    }
+  } else {
+    connect_err = EAFNOSUPPORT;
+  }
+
+  // Switch back to isolated netns so subsequent accept()s are correct.  Any
+  // failure here is non-fatal; we just log.
+  if (sys_setns(g_isolated_ns_fd, CLONE_NEWNET) != 0) {
+    std::fprintf(stderr,
+                 "scene-netnsctl: [proxy] setns(isolated) restore failed: %s\n",
+                 std::strerror(errno));
+  }
+
+  if (upstream < 0) {
+    send_proxy_error(client, connect_err);
+    close(client);
+    return nullptr;
+  }
+
+  uint8_t ok = kProxyStatusOk;
+  if (!write_full_blocking(client, &ok, sizeof(ok))) {
+    close(upstream);
+    close(client);
+    return nullptr;
+  }
+
+  splice_loop(client, upstream);
+  close(upstream);
+  close(client);
+  return nullptr;
+}
+
+uint16_t start_proxy_listener(int *out_listener_fd) {
+  int listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (listener < 0) {
+    die("[proxy] socket");
+  }
+  int yes = 1;
+  setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+  sockaddr_in addr {};
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr.sin_port = 0;  // kernel-assigned ephemeral port
+  if (bind(listener, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
+    die("[proxy] bind");
+  }
+  socklen_t len = sizeof(addr);
+  if (getsockname(listener, reinterpret_cast<sockaddr *>(&addr), &len) != 0) {
+    die("[proxy] getsockname");
+  }
+  if (listen(listener, 64) != 0) {
+    die("[proxy] listen");
+  }
+  *out_listener_fd = listener;
+  return ntohs(addr.sin_port);
+}
+
+void *proxy_acceptor(void *arg) {
+  int listener = *static_cast<int *>(arg);
+  delete static_cast<int *>(arg);
+
+  for (;;) {
+    int client = accept(listener, nullptr, nullptr);
+    if (client < 0) {
+      if (errno == EINTR) continue;
+      std::fprintf(stderr, "scene-netnsctl: [proxy] accept failed: %s\n",
+                   std::strerror(errno));
+      continue;
+    }
+    int flags = fcntl(client, F_GETFD);
+    if (flags >= 0) fcntl(client, F_SETFD, flags | FD_CLOEXEC);
+
+    auto *job = new ProxyJob{client};
+    pthread_t tid;
+    pthread_attr_t pattr;
+    pthread_attr_init(&pattr);
+    pthread_attr_setdetachstate(&pattr, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&tid, &pattr, proxy_worker, job) != 0) {
+      std::fprintf(stderr, "scene-netnsctl: [proxy] pthread_create failed\n");
+      delete job;
+      close(client);
+    }
+    pthread_attr_destroy(&pattr);
+  }
+  return nullptr;
 }
 
 void pin_forever() {
   ensure_run_dir();
   cleanup_stale_endpoint();
+
+  // Capture the host netns fd BEFORE unshare so proxy workers can switch
+  // back into it to dial real destinations.
+  g_host_ns_fd = open_current_netns();
+
   if (sys_unshare(CLONE_NEWNET) != 0) {
     die("[pinner] unshare(CLONE_NEWNET)");
   }
   bring_loopback_up();
-  int ns_fd = open_current_netns();
+  g_isolated_ns_fd = open_current_netns();
 
+  // Bind the legacy unix socket used to hand out the netns fd.
   int server = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (server < 0) {
     die("[pinner] socket");
@@ -392,12 +684,31 @@ void pin_forever() {
   write_endpoint_file(g_sock_path);
   write_pid_file();
 
+  // Start the in-netns transparent TCP proxy.
+  int proxy_listener = -1;
+  uint16_t proxy_port = start_proxy_listener(&proxy_listener);
+  write_proxy_port_file(proxy_port);
+  std::fprintf(stderr, "scene-netnsctl: [proxy] listening on 127.0.0.1:%u\n",
+               static_cast<unsigned>(proxy_port));
+
+  pthread_t accept_tid;
+  pthread_attr_t pattr;
+  pthread_attr_init(&pattr);
+  pthread_attr_setdetachstate(&pattr, PTHREAD_CREATE_DETACHED);
+  int *listener_arg = new int(proxy_listener);
+  if (pthread_create(&accept_tid, &pattr, proxy_acceptor, listener_arg) != 0) {
+    delete listener_arg;
+    die("[proxy] pthread_create acceptor");
+  }
+  pthread_attr_destroy(&pattr);
+
   std::signal(SIGTERM, [](int) {
     if (g_sock_path[0] != '\0') {
       unlink(g_sock_path);
     }
     unlink(kEndpointPath);
     unlink(kPidPath);
+    unlink(kProxyPortPath);
     _exit(0);
   });
 
@@ -416,7 +727,7 @@ void pin_forever() {
       fcntl(client, F_SETFD, flags | FD_CLOEXEC);
     }
     if (peer_is_allowed(client)) {
-      send_fd(client, ns_fd);
+      send_fd(client, g_isolated_ns_fd);
     }
     close(client);
   }
@@ -458,6 +769,20 @@ void status() {
     char pid[64] {};
     if (std::fgets(pid, sizeof(pid), fp)) {
       std::printf("pinner_pid=%s", pid);
+    }
+    std::fclose(fp);
+  }
+
+  fp = std::fopen(kProxyPortPath, "r");
+  if (fp) {
+    char port[16] {};
+    if (std::fgets(port, sizeof(port), fp)) {
+      // strip trailing newline
+      size_t n = std::strlen(port);
+      while (n > 0 && (port[n - 1] == '\n' || port[n - 1] == '\r')) {
+        port[--n] = '\0';
+      }
+      std::printf("proxy_port=%s\n", port);
     }
     std::fclose(fp);
   }
