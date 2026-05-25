@@ -10,11 +10,7 @@
 #include <ctime>
 #include <fcntl.h>
 #include <linux/if.h>
-#include <linux/netfilter_ipv4.h>
-#include <linux/netfilter_ipv6/ip6_tables.h>
 #include <netinet/in.h>
-#include <poll.h>
-#include <pthread.h>
 #include <sched.h>
 #include <string>
 #include <sys/ioctl.h>
@@ -25,16 +21,9 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <vector>
 
 #include "../common/runtime_paths.h"
-
-#ifndef SO_ORIGINAL_DST
-#define SO_ORIGINAL_DST 80
-#endif
-
-#ifndef IP6T_SO_ORIGINAL_DST
-#define IP6T_SO_ORIGINAL_DST 80
-#endif
 
 namespace {
 
@@ -45,9 +34,23 @@ using scene_netns::kUnixPathMax;
 
 constexpr const char *kDefaultShell = "/system/bin/sh";
 
+// veth pair / addressing.  Names are kept short (IFNAMSIZ = 16).
+//
+// CIDR maths:  10.99.99.0/30  -> .1 (host)  .2 (isolated)  .3 (broadcast)
+constexpr const char *kVethHost      = "scn-h";
+constexpr const char *kVethIso       = "scn-i";
+constexpr const char *kVethNetCidr   = "10.99.99.0/30";
+constexpr const char *kVethHostCidr  = "10.99.99.1/30";
+constexpr const char *kVethIsoCidr   = "10.99.99.2/30";
+constexpr const char *kVethGateway   = "10.99.99.1";
+
 char g_sock_path[kUnixPathMax] = {};
-int g_host_ns_fd = -1;        // captured before unshare(): pinner's original netns
-int g_isolated_ns_fd = -1;    // captured after unshare():  the new isolated netns
+int g_host_ns_fd = -1;
+int g_isolated_ns_fd = -1;
+
+// ---------------------------------------------------------------------------
+// Logging helpers (line-buffered, immediately flushed).
+// ---------------------------------------------------------------------------
 
 void log_line(const char *fmt, ...) {
   va_list ap;
@@ -66,14 +69,15 @@ void die(const char *message) {
 
 void die_msg(const char *message) {
   std::fprintf(stderr, "scene-netnsctl: %s\n", message);
+  std::fflush(stderr);
   std::exit(1);
 }
 
+// ---------------------------------------------------------------------------
+// /run dir + endpoint file management.
+// ---------------------------------------------------------------------------
+
 void ensure_run_dir() {
-  // 0755 so that processes inside the isolated netns (apps, root daemons,
-  // anything we explicitly setns into) can later traverse the directory if we
-  // ever publish world-readable status files. Currently nothing in here is
-  // world-readable, but 0755 on the directory itself is safe.
   if (mkdir(kRunDir, 0755) != 0 && errno != EEXIST) {
     die("mkdir run dir");
   }
@@ -85,65 +89,49 @@ bool path_is_in_run_dir(const char *path) {
   if (std::strncmp(path, kRunDir, dir_len) != 0 || path[dir_len] != '/') {
     return false;
   }
-
   const char *leaf = path + dir_len + 1;
   return leaf[0] != '\0' && std::strchr(leaf, '/') == nullptr &&
          std::strlen(path) < kUnixPathMax;
 }
 
 bool read_endpoint_path(char *out, size_t out_size, bool quiet) {
-  if (!out || out_size == 0) {
-    return false;
-  }
+  if (!out || out_size == 0) return false;
   out[0] = '\0';
 
   int fd = open(kEndpointPath, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
   if (fd < 0) {
-    if (!quiet) {
-      die("[client] open pinner endpoint");
-    }
+    if (!quiet) die("[client] open pinner endpoint");
     return false;
   }
-
   struct stat st {};
   if (fstat(fd, &st) != 0) {
     int saved = errno;
     close(fd);
     errno = saved;
-    if (!quiet) {
-      die("[client] stat pinner endpoint");
-    }
+    if (!quiet) die("[client] stat pinner endpoint");
     return false;
   }
   if (!S_ISREG(st.st_mode) || st.st_uid != 0 || (st.st_mode & 0077) != 0) {
     close(fd);
-    if (!quiet) {
-      die_msg("[client] pinner endpoint is not private");
-    }
+    if (!quiet) die_msg("[client] pinner endpoint is not private");
     return false;
   }
-
   ssize_t n = read(fd, out, out_size - 1);
   if (n < 0) {
     int saved = errno;
     close(fd);
     errno = saved;
-    if (!quiet) {
-      die("[client] read pinner endpoint");
-    }
+    if (!quiet) die("[client] read pinner endpoint");
     return false;
   }
   close(fd);
-
   out[n] = '\0';
   while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == '\r' ||
                    out[n - 1] == ' ' || out[n - 1] == '\t')) {
     out[--n] = '\0';
   }
   if (n == 0 || !path_is_in_run_dir(out)) {
-    if (!quiet) {
-      die_msg("[client] pinner endpoint path is invalid");
-    }
+    if (!quiet) die_msg("[client] pinner endpoint path is invalid");
     return false;
   }
   return true;
@@ -151,37 +139,14 @@ bool read_endpoint_path(char *out, size_t out_size, bool quiet) {
 
 void require_private_socket(const char *path) {
   struct stat st {};
-  if (lstat(path, &st) != 0) {
-    die("[client] stat pinner socket");
-  }
-  if (!S_ISSOCK(st.st_mode)) {
-    die_msg("[client] pinner endpoint exists but is not a socket");
-  }
-  if (st.st_uid != 0 || (st.st_mode & 0077) != 0) {
-    die_msg("[client] pinner socket is not private");
-  }
+  if (lstat(path, &st) != 0) die("[client] stat pinner socket");
+  if (!S_ISSOCK(st.st_mode)) die_msg("[client] pinner endpoint exists but is not a socket");
+  if (st.st_uid != 0 || (st.st_mode & 0077) != 0) die_msg("[client] pinner socket is not private");
 }
 
-void bring_loopback_up() {
-  int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-  if (fd < 0) {
-    die("socket");
-  }
-
-  ifreq ifr {};
-  std::snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "lo");
-  if (ioctl(fd, SIOCGIFFLAGS, &ifr) != 0) {
-    close(fd);
-    die("SIOCGIFFLAGS lo");
-  }
-
-  ifr.ifr_flags = static_cast<short>(ifr.ifr_flags | IFF_UP | IFF_RUNNING);
-  if (ioctl(fd, SIOCSIFFLAGS, &ifr) != 0) {
-    close(fd);
-    die("SIOCSIFFLAGS lo");
-  }
-  close(fd);
-}
+// ---------------------------------------------------------------------------
+// netns helpers.
+// ---------------------------------------------------------------------------
 
 int sys_setns(int fd, int nstype) {
   return static_cast<int>(syscall(__NR_setns, fd, nstype));
@@ -191,27 +156,43 @@ int sys_unshare(int flags) {
   return static_cast<int>(syscall(__NR_unshare, flags));
 }
 
+int open_netns(const char *path) {
+  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) die("[pinner] open netns");
+  return fd;
+}
+
+int open_current_netns() { return open_netns("/proc/self/ns/net"); }
+
+void bring_loopback_up() {
+  int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  if (fd < 0) die("socket");
+  ifreq ifr {};
+  std::snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "lo");
+  if (ioctl(fd, SIOCGIFFLAGS, &ifr) != 0) {
+    close(fd);
+    die("SIOCGIFFLAGS lo");
+  }
+  ifr.ifr_flags = static_cast<short>(ifr.ifr_flags | IFF_UP | IFF_RUNNING);
+  if (ioctl(fd, SIOCSIFFLAGS, &ifr) != 0) {
+    close(fd);
+    die("SIOCSIFFLAGS lo");
+  }
+  close(fd);
+}
+
 void write_pid_file() {
   FILE *fp = std::fopen(kPidPath, "w");
-  if (!fp) {
-    die("[pinner] open pid file");
-  }
+  if (!fp) die("[pinner] open pid file");
   std::fprintf(fp, "%d\n", getpid());
   std::fclose(fp);
   chmod(kPidPath, 0600);
 }
 
-int open_netns(const char *path) {
-  int fd = open(path, O_RDONLY | O_CLOEXEC);
-  if (fd < 0) {
-    die("[pinner] open netns");
-  }
-  return fd;
-}
-
-int open_current_netns() {
-  return open_netns("/proc/self/ns/net");
-}
+// ---------------------------------------------------------------------------
+// Unix-socket "give me the netns fd" service (unchanged from the previous
+// design; Zygisk uses this to fetch the pinned netns fd over SCM_RIGHTS).
+// ---------------------------------------------------------------------------
 
 void fill_sockaddr(sockaddr_un *addr, const char *path) {
   std::memset(addr, 0, sizeof(*addr));
@@ -225,12 +206,8 @@ int connect_pinner_socket() {
     die_msg("[client] pinner endpoint is unavailable");
   }
   require_private_socket(sock_path);
-
   int sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-  if (sock < 0) {
-    die("[client] socket");
-  }
-
+  if (sock < 0) die("[client] socket");
   sockaddr_un addr {};
   fill_sockaddr(&addr, sock_path);
   if (connect(sock, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
@@ -251,11 +228,7 @@ int recv_fd(int sock) {
   msg.msg_iovlen = 1;
   msg.msg_control = control;
   msg.msg_controllen = sizeof(control);
-
-  if (recvmsg(sock, &msg, MSG_CMSG_CLOEXEC) < 0) {
-    die("[client] recv netns fd");
-  }
-
+  if (recvmsg(sock, &msg, MSG_CMSG_CLOEXEC) < 0) die("[client] recv netns fd");
   cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
   if (!cmsg || cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS ||
       cmsg->cmsg_len != CMSG_LEN(sizeof(int))) {
@@ -263,9 +236,7 @@ int recv_fd(int sock) {
   }
   int fd = -1;
   std::memcpy(&fd, CMSG_DATA(cmsg), sizeof(fd));
-  if (fd < 0) {
-    die_msg("[client] received invalid namespace fd");
-  }
+  if (fd < 0) die_msg("[client] received invalid namespace fd");
   return fd;
 }
 
@@ -287,37 +258,27 @@ void send_fd(int sock, int fd) {
   msg.msg_iovlen = 1;
   msg.msg_control = control;
   msg.msg_controllen = sizeof(control);
-
   cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
   cmsg->cmsg_level = SOL_SOCKET;
   cmsg->cmsg_type = SCM_RIGHTS;
   cmsg->cmsg_len = CMSG_LEN(sizeof(int));
   std::memcpy(CMSG_DATA(cmsg), &fd, sizeof(fd));
   msg.msg_controllen = CMSG_SPACE(sizeof(int));
-
   if (sendmsg(sock, &msg, MSG_NOSIGNAL) < 0) {
-    std::fprintf(stderr, "scene-netnsctl: [pinner] send netns fd failed: %s\n",
-                 std::strerror(errno));
+    log_line("scene-netnsctl: [pinner] send netns fd failed: %s", std::strerror(errno));
   }
 }
 
 bool peer_is_allowed(int sock) {
-  struct PeerCred {
-    pid_t pid;
-    uid_t uid;
-    gid_t gid;
-  } cred {};
+  struct PeerCred { pid_t pid; uid_t uid; gid_t gid; } cred {};
   socklen_t len = sizeof(cred);
   if (getsockopt(sock, SOL_SOCKET, SO_PEERCRED, &cred, &len) != 0) {
-    std::fprintf(stderr, "scene-netnsctl: [pinner] peer credential check failed: %s\n",
-                 std::strerror(errno));
+    log_line("scene-netnsctl: [pinner] peer credential check failed: %s", std::strerror(errno));
     return false;
   }
   if (cred.uid != 0) {
-    std::fprintf(stderr,
-                 "scene-netnsctl: [pinner] rejected non-root peer: pid=%d uid=%u gid=%u\n",
-                 static_cast<int>(cred.pid), static_cast<unsigned>(cred.uid),
-                 static_cast<unsigned>(cred.gid));
+    log_line("scene-netnsctl: [pinner] rejected non-root peer pid=%d uid=%u",
+             static_cast<int>(cred.pid), static_cast<unsigned>(cred.uid));
     return false;
   }
   return true;
@@ -343,17 +304,18 @@ void exec_command(int argc, char **argv, int first) {
   die("exec command");
 }
 
+// ---------------------------------------------------------------------------
+// Random / temp helpers (used for the unix socket name).
+// ---------------------------------------------------------------------------
+
 uint64_t random_u64() {
   uint64_t value = 0;
   int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
   if (fd >= 0) {
     ssize_t n = read(fd, &value, sizeof(value));
     close(fd);
-    if (n == static_cast<ssize_t>(sizeof(value))) {
-      return value;
-    }
+    if (n == static_cast<ssize_t>(sizeof(value))) return value;
   }
-
   return (static_cast<uint64_t>(std::time(nullptr)) << 32) ^
          (static_cast<uint64_t>(getpid()) << 16) ^
          static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&value));
@@ -366,9 +328,7 @@ std::string make_socket_path() {
                   static_cast<unsigned long long>(random_u64() ^
                                                   static_cast<uint64_t>(attempt)));
     struct stat st {};
-    if (lstat(path, &st) != 0 && errno == ENOENT) {
-      return path;
-    }
+    if (lstat(path, &st) != 0 && errno == ENOENT) return path;
   }
   die_msg("[pinner] unable to allocate private socket path");
   return {};
@@ -376,10 +336,7 @@ std::string make_socket_path() {
 
 void write_endpoint_file(const char *sock_path) {
   int fd = open(kEndpointPath, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
-  if (fd < 0) {
-    die("[pinner] open endpoint file");
-  }
-
+  if (fd < 0) die("[pinner] open endpoint file");
   const size_t len = std::strlen(sock_path);
   if (write(fd, sock_path, len) != static_cast<ssize_t>(len) ||
       write(fd, "\n", 1) != 1) {
@@ -394,292 +351,68 @@ void write_endpoint_file(const char *sock_path) {
 
 void cleanup_stale_endpoint() {
   char stale_path[kUnixPathMax] {};
-  if (read_endpoint_path(stale_path, sizeof(stale_path), true)) {
-    unlink(stale_path);
-  }
+  if (read_endpoint_path(stale_path, sizeof(stale_path), true)) unlink(stale_path);
   unlink(kEndpointPath);
   unlink(kPidPath);
 }
 
 // ---------------------------------------------------------------------------
-// In-netns transparent TCP proxy.
+// veth + NAT setup.
 //
-// We rely on iptables nat OUTPUT REDIRECT to bend every non-loopback TCP
-// connect inside the isolated netns to our local listener. The kernel keeps
-// the original destination accessible via getsockopt(SO_ORIGINAL_DST), so the
-// app process needs no userspace cooperation: it just calls connect() on
-// the real address as if the host network was reachable.
+// Strategy:
+//   * Already in the isolated netns (caller unshare()d before us).
+//   * Fork a helper child, switch the child into the host netns, and run all
+//     the host-side commands (`ip`, `iptables`) there.  The helper passes the
+//     veth's isolated end into our (parent) netns by `ip link set ... netns
+//     <pid>` where pid is the parent pinner.  Because the parent stays in
+//     the isolated netns the helper's pid arg is the easiest way to address
+//     the target ns without having to share an fd with the helper.
+//   * After the helper exits we configure the isolated end of the veth from
+//     the parent (which is in the isolated netns).
 //
-// On accept() the proxy:
-//   1. reads the original destination via SO_ORIGINAL_DST
-//   2. setns(host) so the outbound socket is born in host netns
-//   3. dial the real destination
-//   4. setns(isolated) so the next accept() runs in the right ns
-//   5. splice bytes between client and upstream until either side closes
+// We deliberately call out to the system `ip` and `iptables` binaries; that
+// keeps the implementation small and matches what every Android router /
+// VPN module on the planet does.  All netlink configuration is hidden behind
+// these binaries.
 // ---------------------------------------------------------------------------
 
-bool write_full_blocking(int fd, const void *buf, size_t len) {
-  const uint8_t *p = static_cast<const uint8_t *>(buf);
-  while (len > 0) {
-    ssize_t n = send(fd, p, len, MSG_NOSIGNAL);
-    if (n < 0) {
-      if (errno == EINTR) continue;
-      return false;
+bool find_bin(const char *name, char *out_path, size_t out_size) {
+  static const char *prefixes[] = {
+      "/system/bin/", "/system/xbin/", "/vendor/bin/", nullptr,
+  };
+  for (const char **p = prefixes; *p; ++p) {
+    char candidate[256];
+    std::snprintf(candidate, sizeof(candidate), "%s%s", *p, name);
+    if (access(candidate, X_OK) == 0) {
+      std::snprintf(out_path, out_size, "%s", candidate);
+      return true;
     }
-    if (n == 0) return false;
-    p += n;
-    len -= static_cast<size_t>(n);
   }
-  return true;
+  return false;
 }
 
-void splice_loop(int a, int b) {
-  bool a_to_b_open = true;
-  bool b_to_a_open = true;
-  uint8_t buf[16384];
-
-  while (a_to_b_open || b_to_a_open) {
-    pollfd pfds[2];
-    int n = 0;
-    if (a_to_b_open) {
-      pfds[n].fd = a;
-      pfds[n].events = POLLIN;
-      pfds[n].revents = 0;
-      ++n;
-    }
-    if (b_to_a_open) {
-      pfds[n].fd = b;
-      pfds[n].events = POLLIN;
-      pfds[n].revents = 0;
-      ++n;
-    }
-    int rv = poll(pfds, n, -1);
-    if (rv < 0) {
-      if (errno == EINTR) continue;
-      break;
-    }
-    for (int i = 0; i < n; ++i) {
-      if (!(pfds[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
-      int from = pfds[i].fd;
-      int to = (from == a) ? b : a;
-      bool *side_open = (from == a) ? &a_to_b_open : &b_to_a_open;
-      ssize_t r = recv(from, buf, sizeof(buf), 0);
-      if (r > 0) {
-        if (!write_full_blocking(to, buf, static_cast<size_t>(r))) {
-          a_to_b_open = false;
-          b_to_a_open = false;
-        }
-      } else if (r == 0 || (r < 0 && errno != EINTR)) {
-        *side_open = false;
-        shutdown(to, SHUT_WR);
-      }
-    }
-  }
+// Prefer the legacy iptables binary because Android's nft backend on many
+// OEM kernels is missing the `nat` table.  iptables-legacy talks ip_tables.so
+// directly which is more widely available.
+bool find_iptables(char *out_path, size_t out_size) {
+  if (find_bin("iptables-legacy", out_path, out_size)) return true;
+  return find_bin("iptables", out_path, out_size);
 }
 
-struct ProxyJob {
-  int client_fd;
-  int family;  // AF_INET or AF_INET6
-};
+// Run a binary with argv, capture stdout+stderr, return exit code (-1 on
+// fork/wait error).  Output is logged when status != 0.
+int run_capture(const char *bin, std::vector<const char *> argv,
+                const char *tag) {
+  argv.push_back(nullptr);
 
-void *proxy_worker(void *arg) {
-  ProxyJob *job = static_cast<ProxyJob *>(arg);
-  int client = job->client_fd;
-  int family = job->family;
-  delete job;
-
-  log_line("scene-netnsctl: [proxy] worker accepted family=%d fd=%d",
-           family, client);
-
-  // Pull the original destination out of the connection-tracker. This works
-  // for v4 and v6 once the corresponding REDIRECT rule fired.
-  sockaddr_storage orig {};
-  socklen_t orig_len = sizeof(orig);
-  bool got_orig = false;
-  if (family == AF_INET) {
-    if (getsockopt(client, SOL_IP, SO_ORIGINAL_DST, &orig, &orig_len) == 0) {
-      got_orig = true;
-      const auto *in4 = reinterpret_cast<const sockaddr_in *>(&orig);
-      char buf[64] = {};
-      inet_ntop(AF_INET, &in4->sin_addr, buf, sizeof(buf));
-      log_line("scene-netnsctl: [proxy] orig_dst=%s:%u",
-               buf, ntohs(in4->sin_port));
-    } else {
-      log_line("scene-netnsctl: [proxy] SO_ORIGINAL_DST(v4) failed: %s",
-               std::strerror(errno));
-    }
-  } else if (family == AF_INET6) {
-    orig_len = sizeof(orig);
-    if (getsockopt(client, SOL_IPV6, IP6T_SO_ORIGINAL_DST, &orig, &orig_len) == 0) {
-      got_orig = true;
-      const auto *in6 = reinterpret_cast<const sockaddr_in6 *>(&orig);
-      char buf[INET6_ADDRSTRLEN] = {};
-      inet_ntop(AF_INET6, &in6->sin6_addr, buf, sizeof(buf));
-      log_line("scene-netnsctl: [proxy] orig_dst6=[%s]:%u",
-               buf, ntohs(in6->sin6_port));
-    } else {
-      log_line("scene-netnsctl: [proxy] SO_ORIGINAL_DST(v6) failed: %s",
-               std::strerror(errno));
-    }
-  }
-
-  if (!got_orig) {
-    close(client);
-    return nullptr;
-  }
-
-  // Switch this thread into host netns to make the outbound connection.
-  if (sys_setns(g_host_ns_fd, CLONE_NEWNET) != 0) {
-    log_line("scene-netnsctl: [proxy] setns(host) failed: %s",
-             std::strerror(errno));
-    close(client);
-    return nullptr;
-  }
-  log_line("scene-netnsctl: [proxy] in host netns; dialing upstream...");
-
-  int upstream = socket(family, SOCK_STREAM | SOCK_CLOEXEC, 0);
-  int connect_err = 0;
-  if (upstream < 0) {
-    connect_err = errno;
-    log_line("scene-netnsctl: [proxy] socket() failed: %s",
-             std::strerror(errno));
-  } else {
-    socklen_t addr_size = (family == AF_INET) ? sizeof(sockaddr_in)
-                                              : sizeof(sockaddr_in6);
-    struct timeval tv;
-    tv.tv_sec = 8;
-    tv.tv_usec = 0;
-    setsockopt(upstream, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    setsockopt(upstream, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-    if (connect(upstream, reinterpret_cast<sockaddr *>(&orig), addr_size) != 0) {
-      connect_err = errno;
-      log_line("scene-netnsctl: [proxy] upstream connect failed: %s",
-               std::strerror(errno));
-      close(upstream);
-      upstream = -1;
-    } else {
-      tv.tv_sec = 0;
-      tv.tv_usec = 0;
-      setsockopt(upstream, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-      setsockopt(upstream, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-      log_line("scene-netnsctl: [proxy] upstream connected");
-    }
-  }
-
-  // Restore namespace before doing anything that might touch sockets we
-  // expect to live in the isolated ns.
-  if (sys_setns(g_isolated_ns_fd, CLONE_NEWNET) != 0) {
-    log_line("scene-netnsctl: [proxy] setns(isolated) restore failed: %s",
-             std::strerror(errno));
-  }
-
-  if (upstream < 0) {
-    (void)connect_err;
-    close(client);
-    return nullptr;
-  }
-
-  log_line("scene-netnsctl: [proxy] splicing");
-  splice_loop(client, upstream);
-  log_line("scene-netnsctl: [proxy] splice done");
-  close(upstream);
-  close(client);
-  return nullptr;
-}
-
-uint16_t bind_listener(int family, int *out_listener_fd) {
-  int listener = socket(family, SOCK_STREAM | SOCK_CLOEXEC, 0);
-  if (listener < 0) {
-    die("[proxy] socket");
-  }
-  int yes = 1;
-  setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-
-  uint16_t port = 0;
-  if (family == AF_INET) {
-    sockaddr_in addr {};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = 0;
-    if (bind(listener, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
-      die("[proxy] bind v4");
-    }
-    socklen_t l = sizeof(addr);
-    getsockname(listener, reinterpret_cast<sockaddr *>(&addr), &l);
-    port = ntohs(addr.sin_port);
-  } else {
-    sockaddr_in6 addr {};
-    addr.sin6_family = AF_INET6;
-    addr.sin6_addr = in6addr_loopback;
-    addr.sin6_port = 0;
-    if (bind(listener, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
-      die("[proxy] bind v6");
-    }
-    socklen_t l = sizeof(addr);
-    getsockname(listener, reinterpret_cast<sockaddr *>(&addr), &l);
-    port = ntohs(addr.sin6_port);
-  }
-  if (listen(listener, 64) != 0) {
-    die("[proxy] listen");
-  }
-  *out_listener_fd = listener;
-  return port;
-}
-
-struct AcceptArg {
-  int listener;
-  int family;
-};
-
-void *proxy_acceptor(void *arg) {
-  AcceptArg *a = static_cast<AcceptArg *>(arg);
-  int listener = a->listener;
-  int family = a->family;
-  delete a;
-
-  for (;;) {
-    int client = accept(listener, nullptr, nullptr);
-    if (client < 0) {
-      if (errno == EINTR) continue;
-      std::fprintf(stderr, "scene-netnsctl: [proxy] accept failed: %s\n",
-                   std::strerror(errno));
-      continue;
-    }
-    int flags = fcntl(client, F_GETFD);
-    if (flags >= 0) fcntl(client, F_SETFD, flags | FD_CLOEXEC);
-
-    auto *job = new ProxyJob{client, family};
-    pthread_t tid;
-    pthread_attr_t pattr;
-    pthread_attr_init(&pattr);
-    pthread_attr_setdetachstate(&pattr, PTHREAD_CREATE_DETACHED);
-    if (pthread_create(&tid, &pattr, proxy_worker, job) != 0) {
-      std::fprintf(stderr, "scene-netnsctl: [proxy] pthread_create failed\n");
-      delete job;
-      close(client);
-    }
-    pthread_attr_destroy(&pattr);
-  }
-  return nullptr;
-}
-
-bool run_iptables(const char *bin, const char *family_label,
-                  const char *const *argv) {
-  // Capture child output so we can print it on failure and learn why the OEM
-  // kernel rejected the rule (typical: "table 'nat' does not exist", or "no
-  // chain/target/match by that name").
   int pipefd[2] = {-1, -1};
-  if (pipe(pipefd) != 0) {
-    pipefd[0] = pipefd[1] = -1;
-  }
+  if (pipe(pipefd) != 0) pipefd[0] = pipefd[1] = -1;
 
   pid_t pid = fork();
   if (pid < 0) {
     if (pipefd[0] >= 0) { close(pipefd[0]); close(pipefd[1]); }
-    std::fprintf(stderr, "scene-netnsctl: [proxy] fork %s failed: %s\n",
-                 bin, std::strerror(errno));
-    return false;
+    log_line("scene-netnsctl: [%s] fork %s failed: %s", tag, bin, std::strerror(errno));
+    return -1;
   }
   if (pid == 0) {
     if (pipefd[1] >= 0) {
@@ -688,7 +421,7 @@ bool run_iptables(const char *bin, const char *family_label,
       close(pipefd[0]);
       close(pipefd[1]);
     }
-    execv(bin, const_cast<char *const *>(argv));
+    execv(bin, const_cast<char *const *>(argv.data()));
     _exit(127);
   }
 
@@ -705,157 +438,192 @@ bool run_iptables(const char *bin, const char *family_label,
 
   int status = 0;
   if (waitpid(pid, &status, 0) < 0) {
-    std::fprintf(stderr, "scene-netnsctl: [proxy] waitpid %s: %s\n",
-                 bin, std::strerror(errno));
+    log_line("scene-netnsctl: [%s] waitpid %s: %s", tag, bin, std::strerror(errno));
+    return -1;
+  }
+  int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+  if (exit_code != 0) {
+    log_line("scene-netnsctl: [%s] %s exit=%d output=<<%s>>",
+             tag, bin, exit_code,
+             captured.empty() ? "(empty)" : captured.c_str());
+  }
+  return exit_code;
+}
+
+// Build argv for run_capture from a string list.
+struct Cmd {
+  std::vector<std::string> args;
+  Cmd(std::initializer_list<const char *> list) {
+    for (const char *s : list) args.emplace_back(s);
+  }
+  std::vector<const char *> argv() const {
+    std::vector<const char *> v;
+    v.reserve(args.size() + 1);
+    for (const auto &s : args) v.push_back(s.c_str());
+    return v;
+  }
+};
+
+bool write_proc_file(const char *path, const char *value) {
+  int fd = open(path, O_WRONLY | O_CLOEXEC);
+  if (fd < 0) {
+    log_line("scene-netnsctl: [veth] open %s failed: %s", path, std::strerror(errno));
+    return false;
+  }
+  size_t len = std::strlen(value);
+  bool ok = write(fd, value, len) == static_cast<ssize_t>(len);
+  close(fd);
+  if (!ok) {
+    log_line("scene-netnsctl: [veth] write %s failed: %s", path, std::strerror(errno));
+  }
+  return ok;
+}
+
+// Helper child entry: switch to host netns, set up veth + NAT, then exit.
+[[noreturn]] void host_setup_child(pid_t parent_pid_in_isolated) {
+  // Switch this child process into the host netns.
+  if (sys_setns(g_host_ns_fd, CLONE_NEWNET) != 0) {
+    log_line("scene-netnsctl: [veth-host] setns(host) failed: %s", std::strerror(errno));
+    _exit(2);
+  }
+
+  char ip_bin[256] = {};
+  char iptables_bin[256] = {};
+  if (!find_bin("ip", ip_bin, sizeof(ip_bin))) {
+    log_line("scene-netnsctl: [veth-host] no `ip` binary available");
+    _exit(3);
+  }
+  if (!find_iptables(iptables_bin, sizeof(iptables_bin))) {
+    log_line("scene-netnsctl: [veth-host] no `iptables` binary available");
+    _exit(4);
+  }
+
+  // Best-effort cleanup of any stale state from previous runs.  The kernel
+  // auto-removes the veth pair when its peer's netns disappears, but if the
+  // pinner restarted and the host side leaked we want to clear it manually.
+  // All these can fail silently.
+  Cmd c_link_del = {ip_bin, "link", "del", kVethHost};
+  run_capture(ip_bin, c_link_del.argv(), "veth-host-cleanup");
+
+  Cmd c_nat_del = {iptables_bin, "-t", "nat", "-D", "POSTROUTING",
+                   "-s", kVethNetCidr, "-j", "MASQUERADE"};
+  run_capture(iptables_bin, c_nat_del.argv(), "veth-host-cleanup");
+  Cmd c_fwd_in_del = {iptables_bin, "-D", "FORWARD",
+                      "-i", kVethHost, "-j", "ACCEPT"};
+  run_capture(iptables_bin, c_fwd_in_del.argv(), "veth-host-cleanup");
+  Cmd c_fwd_out_del = {iptables_bin, "-D", "FORWARD",
+                       "-o", kVethHost, "-j", "ACCEPT"};
+  run_capture(iptables_bin, c_fwd_out_del.argv(), "veth-host-cleanup");
+
+  // Create veth pair.  Both ends start in host netns.
+  Cmd c_link_add = {ip_bin, "link", "add", kVethHost,
+                    "type", "veth", "peer", "name", kVethIso};
+  if (run_capture(ip_bin, c_link_add.argv(), "veth-host") != 0) _exit(5);
+
+  // Move the iso end to the parent (which lives in the isolated netns).
+  char pid_str[32];
+  std::snprintf(pid_str, sizeof(pid_str), "%d",
+                static_cast<int>(parent_pid_in_isolated));
+  Cmd c_link_to_ns = {ip_bin, "link", "set", kVethIso, "netns", pid_str};
+  if (run_capture(ip_bin, c_link_to_ns.argv(), "veth-host") != 0) _exit(6);
+
+  // Configure host-side veth.
+  Cmd c_addr = {ip_bin, "addr", "add", kVethHostCidr, "dev", kVethHost};
+  if (run_capture(ip_bin, c_addr.argv(), "veth-host") != 0) _exit(7);
+  Cmd c_up = {ip_bin, "link", "set", kVethHost, "up"};
+  if (run_capture(ip_bin, c_up.argv(), "veth-host") != 0) _exit(8);
+
+  // Enable forwarding in host netns (per-netns sysctl).
+  if (!write_proc_file("/proc/sys/net/ipv4/ip_forward", "1\n")) _exit(9);
+
+  // NAT + forward rules.  We use -I (insert at top) for FORWARD so that any
+  // OEM-supplied DROP/REJECT rules later in the chain don't shadow ours.
+  Cmd c_nat = {iptables_bin, "-t", "nat", "-A", "POSTROUTING",
+               "-s", kVethNetCidr, "-j", "MASQUERADE"};
+  if (run_capture(iptables_bin, c_nat.argv(), "veth-host") != 0) _exit(10);
+  Cmd c_fwd_in = {iptables_bin, "-I", "FORWARD", "1",
+                  "-i", kVethHost, "-j", "ACCEPT"};
+  if (run_capture(iptables_bin, c_fwd_in.argv(), "veth-host") != 0) _exit(11);
+  Cmd c_fwd_out = {iptables_bin, "-I", "FORWARD", "1",
+                   "-o", kVethHost, "-j", "ACCEPT"};
+  if (run_capture(iptables_bin, c_fwd_out.argv(), "veth-host") != 0) _exit(12);
+
+  log_line("scene-netnsctl: [veth-host] host side ready (%s on %s, MASQ for %s)",
+           kVethHostCidr, kVethHost, kVethNetCidr);
+  _exit(0);
+}
+
+bool setup_veth_and_routes() {
+  // Caller (us) is currently in the isolated netns.  Fork a helper that
+  // setns()es into host and configures the host side + creates the veth.
+  pid_t my_pid = getpid();
+  pid_t helper = fork();
+  if (helper < 0) {
+    log_line("scene-netnsctl: [veth] fork helper failed: %s", std::strerror(errno));
+    return false;
+  }
+  if (helper == 0) {
+    host_setup_child(my_pid);  // [[noreturn]]
+  }
+
+  int status = 0;
+  if (waitpid(helper, &status, 0) < 0) {
+    log_line("scene-netnsctl: [veth] waitpid helper failed: %s", std::strerror(errno));
     return false;
   }
   if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-    int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-    std::fprintf(stderr,
-                 "scene-netnsctl: [proxy] %s (%s) failed exit=%d output=<<%s>>\n",
-                 bin, family_label, exit_code,
-                 captured.empty() ? "(empty)" : captured.c_str());
+    int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    log_line("scene-netnsctl: [veth] host helper exited with %d", code);
     return false;
   }
+
+  // The iso peer is now sitting in our (isolated) netns, down, no addrs.
+  char ip_bin[256] = {};
+  if (!find_bin("ip", ip_bin, sizeof(ip_bin))) {
+    log_line("scene-netnsctl: [veth-iso] no `ip` binary available");
+    return false;
+  }
+
+  Cmd c_addr = {ip_bin, "addr", "add", kVethIsoCidr, "dev", kVethIso};
+  if (run_capture(ip_bin, c_addr.argv(), "veth-iso") != 0) return false;
+  Cmd c_up = {ip_bin, "link", "set", kVethIso, "up"};
+  if (run_capture(ip_bin, c_up.argv(), "veth-iso") != 0) return false;
+
+  // Add a default route via the host side.
+  Cmd c_def = {ip_bin, "route", "add", "default", "via", kVethGateway,
+               "dev", kVethIso};
+  if (run_capture(ip_bin, c_def.argv(), "veth-iso") != 0) return false;
+
+  log_line("scene-netnsctl: [veth-iso] iso side ready (%s on %s, default via %s)",
+           kVethIsoCidr, kVethIso, kVethGateway);
   return true;
 }
 
-bool find_iptables_binary(const char *family,
-                          char *out_path, size_t out_size) {
-  // Order: prefer the legacy binary because Android's nf_tables backend on
-  // many OEM kernels lacks the `nat` table.  iptables-legacy talks ip_tables.so
-  // which still exposes nat OUTPUT in most ROMs.
-  const char *prefixes[] = {
-      "/system/bin/",
-      "/system/xbin/",
-      "/vendor/bin/",
-      nullptr,
-  };
-  const char *names_v4[] = {"iptables-legacy", "iptables", nullptr};
-  const char *names_v6[] = {"ip6tables-legacy", "ip6tables", nullptr};
-  const char **names = (strcmp(family, "ipv6") == 0) ? names_v6 : names_v4;
-  for (const char **p = prefixes; *p; ++p) {
-    for (const char **n = names; *n; ++n) {
-      char candidate[256];
-      std::snprintf(candidate, sizeof(candidate), "%s%s", *p, *n);
-      if (access(candidate, X_OK) == 0) {
-        std::snprintf(out_path, out_size, "%s", candidate);
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
-bool find_ip_binary(char *out_path, size_t out_size) {
-  static const char *candidates[] = {
-      "/system/bin/ip",
-      "/system/xbin/ip",
-      "/vendor/bin/ip",
-      nullptr,
-  };
-  for (const char **p = candidates; *p; ++p) {
-    if (access(*p, X_OK) == 0) {
-      std::snprintf(out_path, out_size, "%s", *p);
-      return true;
-    }
-  }
-  return false;
-}
-
-// A fresh netns has only lo (UP) and a handful of DOWN tunnels with no routes.
-// Without any route the kernel rejects connect(non-loopback) with
-// ENETUNREACH BEFORE the iptables OUTPUT chain runs, so our NAT REDIRECT
-// rule never fires.  Adding a default route via lo makes every destination
-// "routable through lo", which gives the OUTPUT chain a chance to rewrite
-// the packet to 127.0.0.1:<proxy_port> and have it delivered locally.
-bool install_lo_default_route() {
-  char ip_bin[256] = {};
-  if (!find_ip_binary(ip_bin, sizeof(ip_bin))) {
-    std::fprintf(stderr,
-                 "scene-netnsctl: [proxy] no `ip` binary available; "
-                 "outbound traffic will fail\n");
-    return false;
-  }
-
-  const char *v4_args[] = {
-      ip_bin, "route", "add", "default", "dev", "lo", nullptr};
-  bool ok_v4 = run_iptables(ip_bin, "ip-route v4", v4_args);
-
-  const char *v6_args[] = {
-      ip_bin, "-6", "route", "add", "default", "dev", "lo", nullptr};
-  bool ok_v6 = run_iptables(ip_bin, "ip-route v6", v6_args);
-  if (!ok_v6) {
-    std::fprintf(stderr,
-                 "scene-netnsctl: [proxy] ipv6 default route via lo failed; "
-                 "v6 outbound will fail\n");
-  }
-  return ok_v4;
-}
-
-bool install_redirect_rules(uint16_t v4_port, uint16_t v6_port) {
-  char v4_port_str[8];
-  char v6_port_str[8];
-  std::snprintf(v4_port_str, sizeof(v4_port_str), "%u", v4_port);
-  std::snprintf(v6_port_str, sizeof(v6_port_str), "%u", v6_port);
-
-  char v4_bin[256] = {};
-  char v6_bin[256] = {};
-  bool have_v4_bin = find_iptables_binary("ipv4", v4_bin, sizeof(v4_bin));
-  bool have_v6_bin = find_iptables_binary("ipv6", v6_bin, sizeof(v6_bin));
-  if (!have_v4_bin) {
-    std::fprintf(stderr,
-                 "scene-netnsctl: [proxy] no iptables binary available; "
-                 "outbound redirect cannot be installed\n");
-    return false;
-  }
-
-  std::fprintf(stderr, "scene-netnsctl: [proxy] using v4=%s v6=%s\n",
-               v4_bin, have_v6_bin ? v6_bin : "(none)");
-
-  const char *v4_args[] = {
-      v4_bin, "-t", "nat", "-A", "OUTPUT",
-      "-p", "tcp", "!", "-d", "127.0.0.0/8",
-      "-j", "REDIRECT", "--to-ports", v4_port_str, nullptr};
-
-  bool ok_v4 = run_iptables(v4_bin, "ipv4", v4_args);
-
-  bool ok_v6 = false;
-  if (have_v6_bin) {
-    const char *v6_args[] = {
-        v6_bin, "-t", "nat", "-A", "OUTPUT",
-        "-p", "tcp", "!", "-d", "::1",
-        "-j", "REDIRECT", "--to-ports", v6_port_str, nullptr};
-    ok_v6 = run_iptables(v6_bin, "ipv6", v6_args);
-  }
-
-  if (!ok_v6) {
-    std::fprintf(stderr,
-                 "scene-netnsctl: [proxy] ipv6 redirect unavailable; "
-                 "v6 outbound traffic will not work\n");
-  }
-  return ok_v4;
-}
+// ---------------------------------------------------------------------------
+// Pin loop.
+// ---------------------------------------------------------------------------
 
 void pin_forever() {
   ensure_run_dir();
   cleanup_stale_endpoint();
 
-  // Capture the host netns fd BEFORE unshare so proxy workers can switch
-  // back into it to dial real destinations.
   g_host_ns_fd = open_current_netns();
 
-  if (sys_unshare(CLONE_NEWNET) != 0) {
-    die("[pinner] unshare(CLONE_NEWNET)");
-  }
+  if (sys_unshare(CLONE_NEWNET) != 0) die("[pinner] unshare(CLONE_NEWNET)");
   bring_loopback_up();
   g_isolated_ns_fd = open_current_netns();
 
-  // Bind the legacy unix socket used to hand out the netns fd.
-  int server = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-  if (server < 0) {
-    die("[pinner] socket");
+  // Plumb veth + NAT.  Failure is non-fatal: the unix endpoint still works
+  // and Zygisk can still place Scene into the netns; outbound traffic will
+  // simply fail closed, which is the same situation as previous proxy
+  // attempts but at least the operator can inspect the situation.
+  bool net_ok = setup_veth_and_routes();
+  if (!net_ok) {
+    log_line("scene-netnsctl: [pinner] veth setup failed; outbound will not work");
   }
+
+  int server = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (server < 0) die("[pinner] socket");
   std::string sock_path = make_socket_path();
   std::snprintf(g_sock_path, sizeof(g_sock_path), "%s", sock_path.c_str());
   unlink(g_sock_path);
@@ -865,101 +633,36 @@ void pin_forever() {
     die("[pinner] bind socket");
   }
   chmod(g_sock_path, 0600);
-  if (listen(server, 16) != 0) {
-    die("[pinner] listen socket");
-  }
+  if (listen(server, 16) != 0) die("[pinner] listen socket");
   write_endpoint_file(g_sock_path);
   write_pid_file();
 
-  // Start the in-netns transparent TCP proxy: one v4 listener and one v6.
-  int v4_listener = -1;
-  int v6_listener = -1;
-  uint16_t v4_port = bind_listener(AF_INET, &v4_listener);
-  uint16_t v6_port = bind_listener(AF_INET6, &v6_listener);
-  std::fprintf(stderr, "scene-netnsctl: [proxy] v4 listener on 127.0.0.1:%u\n",
-               static_cast<unsigned>(v4_port));
-  std::fprintf(stderr, "scene-netnsctl: [proxy] v6 listener on [::1]:%u\n",
-               static_cast<unsigned>(v6_port));
-
-  // Plumb iptables nat OUTPUT inside the isolated netns. Any TCP connect
-  // (other than to loopback) is now redirected to our listener; the kernel
-  // remembers the original destination for SO_ORIGINAL_DST.
-  //
-  // Two prerequisites must hold for this to work:
-  //   * the destination must be routable, otherwise the kernel returns
-  //     ENETUNREACH before the OUTPUT chain ever runs
-  //   * the OUTPUT chain must accept the REDIRECT target
-  //
-  // We satisfy the first by adding a default route via lo; everything is
-  // "routable" through loopback, and the REDIRECT target rewrites the packet
-  // to 127.0.0.1:<proxy_port> which is what we actually want.
-  bool route_ok = install_lo_default_route();
-  if (!route_ok) {
-    std::fprintf(stderr,
-                 "scene-netnsctl: [proxy] default route via lo not installed; "
-                 "outbound traffic will fail with ENETUNREACH\n");
-  }
-
-  // If the kernel does not allow nat OUTPUT inside our netns we deliberately
-  // do NOT die here.  The unix-socket netns service still works (so Zygisk
-  // can put Scene in this netns) and the proxy listener exists; outbound
-  // traffic will fail, but Scene's loopback isolation is preserved and the
-  // operator gets a chance to inspect the situation.
-  bool redirect_ok = install_redirect_rules(v4_port, v6_port);
-  if (!redirect_ok) {
-    std::fprintf(stderr,
-                 "scene-netnsctl: [proxy] iptables redirect not installed; "
-                 "outbound traffic will not work until this is resolved\n");
-  } else {
-    std::fprintf(stderr, "scene-netnsctl: [proxy] iptables redirect installed\n");
-  }
-
-  pthread_attr_t pattr;
-  pthread_attr_init(&pattr);
-  pthread_attr_setdetachstate(&pattr, PTHREAD_CREATE_DETACHED);
-
-  pthread_t v4_tid, v6_tid;
-  auto *v4_arg = new AcceptArg{v4_listener, AF_INET};
-  if (pthread_create(&v4_tid, &pattr, proxy_acceptor, v4_arg) != 0) {
-    delete v4_arg;
-    die("[proxy] pthread_create v4");
-  }
-  auto *v6_arg = new AcceptArg{v6_listener, AF_INET6};
-  if (pthread_create(&v6_tid, &pattr, proxy_acceptor, v6_arg) != 0) {
-    delete v6_arg;
-    std::fprintf(stderr, "scene-netnsctl: [proxy] v6 acceptor not started\n");
-  }
-  pthread_attr_destroy(&pattr);
-
   std::signal(SIGTERM, [](int) {
-    if (g_sock_path[0] != '\0') {
-      unlink(g_sock_path);
-    }
+    if (g_sock_path[0] != '\0') unlink(g_sock_path);
     unlink(kEndpointPath);
     unlink(kPidPath);
     _exit(0);
   });
 
+  log_line("scene-netnsctl: [pinner] ready (net_ok=%d)", net_ok ? 1 : 0);
+
   for (;;) {
     int client = accept(server, nullptr, nullptr);
     if (client < 0) {
-      if (errno == EINTR) {
-        continue;
-      }
-      std::fprintf(stderr, "scene-netnsctl: [pinner] accept failed: %s\n",
-                   std::strerror(errno));
+      if (errno == EINTR) continue;
+      log_line("scene-netnsctl: [pinner] accept failed: %s", std::strerror(errno));
       continue;
     }
     int flags = fcntl(client, F_GETFD);
-    if (flags >= 0) {
-      fcntl(client, F_SETFD, flags | FD_CLOEXEC);
-    }
-    if (peer_is_allowed(client)) {
-      send_fd(client, g_isolated_ns_fd);
-    }
+    if (flags >= 0) fcntl(client, F_SETFD, flags | FD_CLOEXEC);
+    if (peer_is_allowed(client)) send_fd(client, g_isolated_ns_fd);
     close(client);
   }
 }
+
+// ---------------------------------------------------------------------------
+// status subcommand.
+// ---------------------------------------------------------------------------
 
 void status() {
   char sock_path[kUnixPathMax] {};
@@ -967,12 +670,8 @@ void status() {
     die_msg("[client] pinner endpoint is unavailable");
   }
   struct stat sock_st {};
-  if (lstat(sock_path, &sock_st) != 0) {
-    die("[client] stat pinner socket");
-  }
-  if (!S_ISSOCK(sock_st.st_mode)) {
-    die_msg("[client] pinner endpoint exists but is not a socket");
-  }
+  if (lstat(sock_path, &sock_st) != 0) die("[client] stat pinner socket");
+  if (!S_ISSOCK(sock_st.st_mode)) die_msg("[client] pinner endpoint exists but is not a socket");
   if (sock_st.st_uid != 0 || (sock_st.st_mode & 0077) != 0) {
     die_msg("[client] pinner socket is not private");
   }
@@ -995,9 +694,7 @@ void status() {
   FILE *fp = std::fopen(kPidPath, "r");
   if (fp) {
     char pid[64] {};
-    if (std::fgets(pid, sizeof(pid), fp)) {
-      std::printf("pinner_pid=%s", pid);
-    }
+    if (std::fgets(pid, sizeof(pid), fp)) std::printf("pinner_pid=%s", pid);
     std::fclose(fp);
   }
 }
@@ -1005,19 +702,14 @@ void status() {
 }  // namespace
 
 int main(int argc, char **argv) {
-  if (argc < 2) {
-    die_msg("usage: scene-netnsctl {pin|enter|status} [-- command...]");
-  }
-
+  if (argc < 2) die_msg("usage: scene-netnsctl {pin|enter|status} [-- command...]");
   std::string cmd = argv[1];
   if (cmd == "pin") {
     pin_forever();
   } else if (cmd == "enter") {
     enter_netns();
     int first = 2;
-    if (first < argc && std::strcmp(argv[first], "--") == 0) {
-      ++first;
-    }
+    if (first < argc && std::strcmp(argv[first], "--") == 0) ++first;
     exec_command(argc, argv, first);
   } else if (cmd == "status") {
     status();
