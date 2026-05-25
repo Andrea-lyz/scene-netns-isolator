@@ -10,7 +10,10 @@
 #include <ctime>
 #include <fcntl.h>
 #include <linux/if.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <pthread.h>
 #include <sched.h>
 #include <string>
@@ -403,9 +406,11 @@ bool find_iptables(char *out_path, size_t out_size) {
 }
 
 // Run a binary with argv, capture stdout+stderr, return exit code (-1 on
-// fork/wait error).  Output is logged when status != 0.
+// fork/wait error).  Output is logged when status != 0 unless `silent` is
+// true (used for best-effort cleanup paths where every command "fails" the
+// first time because there's nothing to remove).
 int run_capture(const char *bin, std::vector<const char *> argv,
-                const char *tag) {
+                const char *tag, bool silent = false) {
   argv.push_back(nullptr);
 
   int pipefd[2] = {-1, -1};
@@ -414,7 +419,8 @@ int run_capture(const char *bin, std::vector<const char *> argv,
   pid_t pid = fork();
   if (pid < 0) {
     if (pipefd[0] >= 0) { close(pipefd[0]); close(pipefd[1]); }
-    log_line("scene-netnsctl: [%s] fork %s failed: %s", tag, bin, std::strerror(errno));
+    if (!silent)
+      log_line("scene-netnsctl: [%s] fork %s failed: %s", tag, bin, std::strerror(errno));
     return -1;
   }
   if (pid == 0) {
@@ -441,11 +447,12 @@ int run_capture(const char *bin, std::vector<const char *> argv,
 
   int status = 0;
   if (waitpid(pid, &status, 0) < 0) {
-    log_line("scene-netnsctl: [%s] waitpid %s: %s", tag, bin, std::strerror(errno));
+    if (!silent)
+      log_line("scene-netnsctl: [%s] waitpid %s: %s", tag, bin, std::strerror(errno));
     return -1;
   }
   int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-  if (exit_code != 0) {
+  if (exit_code != 0 && !silent) {
     log_line("scene-netnsctl: [%s] %s exit=%d output=<<%s>>",
              tag, bin, exit_code,
              captured.empty() ? "(empty)" : captured.c_str());
@@ -514,26 +521,27 @@ bool write_proc_file(const char *path, const char *value) {
   // pinner restarted and the host side leaked we want to clear it manually.
   // All these can fail silently.
   Cmd c_link_del = {ip_bin, "link", "del", kVethHost};
-  run_capture(ip_bin, c_link_del.argv(), "veth-host-cleanup");
+  run_capture(ip_bin, c_link_del.argv(), "veth-host-cleanup", /*silent=*/true);
 
   Cmd c_nat_del = {iptables_bin, "-t", "nat", "-D", "POSTROUTING",
                    "-s", kVethNetCidr, "-j", "MASQUERADE"};
-  run_capture(iptables_bin, c_nat_del.argv(), "veth-host-cleanup");
+  run_capture(iptables_bin, c_nat_del.argv(), "veth-host-cleanup", /*silent=*/true);
   Cmd c_fwd_in_del = {iptables_bin, "-D", "FORWARD",
                       "-i", kVethHost, "-j", "ACCEPT"};
-  run_capture(iptables_bin, c_fwd_in_del.argv(), "veth-host-cleanup");
+  run_capture(iptables_bin, c_fwd_in_del.argv(), "veth-host-cleanup", /*silent=*/true);
   Cmd c_fwd_out_del = {iptables_bin, "-D", "FORWARD",
                        "-o", kVethHost, "-j", "ACCEPT"};
-  run_capture(iptables_bin, c_fwd_out_del.argv(), "veth-host-cleanup");
+  run_capture(iptables_bin, c_fwd_out_del.argv(), "veth-host-cleanup", /*silent=*/true);
   // Drop any rule we may have left pointing at table 99 from a prior run;
   // the routing watchdog will recreate it once it knows the new upstream.
   for (int i = 0; i < 4; ++i) {
     Cmd c_rule_del = {ip_bin, "rule", "del", "iif", kVethHost,
                       "table", "99"};
-    if (run_capture(ip_bin, c_rule_del.argv(), "veth-host-cleanup") != 0) break;
+    if (run_capture(ip_bin, c_rule_del.argv(), "veth-host-cleanup",
+                    /*silent=*/true) != 0) break;
   }
   Cmd c_table_flush = {ip_bin, "route", "flush", "table", "99"};
-  run_capture(ip_bin, c_table_flush.argv(), "veth-host-cleanup");
+  run_capture(ip_bin, c_table_flush.argv(), "veth-host-cleanup", /*silent=*/true);
 
   // Create veth pair.  Both ends start in host netns.
   Cmd c_link_add = {ip_bin, "link", "add", kVethHost,
@@ -675,10 +683,11 @@ bool write_proc_file(const char *path, const char *value) {
   for (int i = 0; i < 4; ++i) {
     Cmd c_rule_del = {ip_bin, "rule", "del", "iif", kVethHost,
                       "table", "99"};
-    if (run_capture(ip_bin, c_rule_del.argv(), "route-refresh") != 0) break;
+    if (run_capture(ip_bin, c_rule_del.argv(), "route-refresh",
+                    /*silent=*/true) != 0) break;
   }
   Cmd c_table_flush = {ip_bin, "route", "flush", "table", "99"};
-  run_capture(ip_bin, c_table_flush.argv(), "route-refresh");
+  run_capture(ip_bin, c_table_flush.argv(), "route-refresh", /*silent=*/true);
 
   // Rebuild table 99.
   Cmd c_route_dflt = {ip_bin, "route", "add", "default",
@@ -721,18 +730,105 @@ bool refresh_routing_once() {
   return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
-// Background watchdog: keep polling until refresh_routing_once succeeds, then
-// poll less aggressively to pick up wifi <-> mobile-data switches.
+// Background watchdog: keep table 99 in sync with whichever upstream the
+// device currently uses.
+//
+// Two strategies, with automatic fall-back:
+//   1. Subscribe to the host's AF_NETLINK RTMGRP_IPV4_ROUTE multicast group
+//      and refresh on any RTM_NEWROUTE/RTM_DELROUTE event.  This is zero
+//      CPU when nothing is happening and reacts in milliseconds.  Requires
+//      the watchdog thread to setns() into the host netns -- per-thread
+//      setns is supported on Linux >=3.0 and does not affect the rest of
+//      the process.
+//   2. If the netlink socket cannot be created (kernel SELinux denial,
+//      module loaded into a context that cannot create AF_NETLINK), poll
+//      every 30s as a fallback.
+//
+// In both modes we issue an initial refresh as soon as we start, so the
+// "wifi just came up" case is handled even if no further routing events
+// fire before Scene tries to connect.
 void *routing_watchdog(void *) {
-  // First, retry quickly until the upstream comes up.
+  // Step 1: keep retrying initial refresh until it succeeds.  This handles
+  // the boot-time race where pinner starts before wifi does.
   for (int attempt = 0; attempt < 60; ++attempt) {
     if (refresh_routing_once()) break;
     sleep(2);
   }
-  // Steady state: poll every 30s.  This is cheap because the child caches
-  // the last applied upstream and exits early if nothing changed.
+
+  // Step 2: try to switch this thread into host netns and open a netlink
+  // socket subscribed to route changes.
+  bool netlink_ok = false;
+  int nl = -1;
+  if (sys_setns(g_host_ns_fd, CLONE_NEWNET) == 0) {
+    nl = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+    if (nl >= 0) {
+      sockaddr_nl sa {};
+      sa.nl_family = AF_NETLINK;
+      // RTMGRP_IPV4_ROUTE = 0x40, RTMGRP_IPV6_ROUTE = 0x400.  We listen to
+      // both so that link transitions on dual-stack networks (wifi getting
+      // a v4 lease 200ms after a v6 RA) trigger a refresh.
+      sa.nl_groups = 0x40 | 0x400;
+      if (bind(nl, reinterpret_cast<sockaddr *>(&sa), sizeof(sa)) == 0) {
+        netlink_ok = true;
+        log_line("scene-netnsctl: [route-watchdog] using netlink monitor");
+      } else {
+        log_line("scene-netnsctl: [route-watchdog] netlink bind failed: %s",
+                 std::strerror(errno));
+        close(nl);
+        nl = -1;
+      }
+    } else {
+      log_line("scene-netnsctl: [route-watchdog] netlink socket failed: %s",
+               std::strerror(errno));
+    }
+    // The thread stays in host netns from this point on.  That's fine: the
+    // refresh helper forks a fresh child for every refresh so it doesn't
+    // matter where this thread is, and it does NOT touch any unix-domain
+    // socket bound in the isolated netns (the listener thread runs in the
+    // main thread's original ns).
+  } else {
+    log_line("scene-netnsctl: [route-watchdog] setns(host) failed; falling "
+             "back to polling: %s", std::strerror(errno));
+  }
+
+  if (!netlink_ok) {
+    // Fallback path: poll every 30s.
+    for (;;) {
+      sleep(30);
+      refresh_routing_once();
+    }
+  }
+
+  // Netlink monitor: drain events and coalesce bursts.  We don't bother
+  // parsing the message bodies -- any route change is enough reason to ask
+  // refresh_routing_once() to re-evaluate.  refresh_routing_once short-
+  // circuits when the chosen upstream hasn't actually changed, so even a
+  // burst of unrelated route updates costs us only one fork+exec.
+  char buf[8192];
   for (;;) {
-    sleep(30);
+    ssize_t n = recv(nl, buf, sizeof(buf), 0);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      log_line("scene-netnsctl: [route-watchdog] netlink recv failed: %s; "
+               "falling back to polling", std::strerror(errno));
+      close(nl);
+      for (;;) {
+        sleep(30);
+        refresh_routing_once();
+      }
+    }
+    if (n == 0) continue;
+
+    // Coalesce bursts: drain anything else already queued, then sleep a
+    // tiny bit so a wifi-up event that arrives as a flurry of NEWROUTE
+    // messages collapses into a single refresh.  Refresh itself does fork
+    // + ip + iptables, which takes ~100ms; we don't want to do that twenty
+    // times in a row.
+    pollfd pfd {nl, POLLIN, 0};
+    while (poll(&pfd, 1, 250) > 0) {
+      if (recv(nl, buf, sizeof(buf), 0) <= 0) break;
+    }
+
     refresh_routing_once();
   }
   return nullptr;
