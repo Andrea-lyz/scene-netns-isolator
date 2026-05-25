@@ -548,6 +548,119 @@ bool write_proc_file(const char *path, const char *value) {
                    "-o", kVethHost, "-j", "ACCEPT"};
   if (run_capture(iptables_bin, c_fwd_out.argv(), "veth-host") != 0) _exit(12);
 
+  // Android does not put a default route in the main routing table; instead
+  // each network has its own per-network table selected by uid/mark/oif
+  // policy rules set up by netd.  When forwarded packets enter the host from
+  // scn-h they have no fwmark and no matching uid, so the kernel cannot find
+  // any default route and silently drops them BEFORE FORWARD ever runs.
+  //
+  // Build a private routing table that mirrors whichever default network the
+  // device currently uses, then add an `iif scn-h` rule that selects it.
+  // A reasonable preference (11000) puts us before the main lookup but after
+  // netd's per-network rules so we don't disturb anything else.
+  //
+  // We discover the default upstream by inspecting `ip route show table all
+  // default` and taking the first entry's gateway and oif.  This is the same
+  // approach Android's own ConnectivityService uses internally and survives
+  // wifi/mobile data switching well enough for the pinner's lifetime; if the
+  // user roams onto a different network the proxy keeps using the original
+  // upstream until pinner is restarted.
+  auto run_capture_text = [](const char *bin, std::vector<const char *> argv,
+                              std::string *out) -> int {
+    argv.push_back(nullptr);
+    int pipefd[2] = {-1, -1};
+    if (pipe(pipefd) != 0) return -1;
+    pid_t pid = fork();
+    if (pid < 0) {
+      close(pipefd[0]); close(pipefd[1]);
+      return -1;
+    }
+    if (pid == 0) {
+      dup2(pipefd[1], STDOUT_FILENO);
+      dup2(pipefd[1], STDERR_FILENO);
+      close(pipefd[0]); close(pipefd[1]);
+      execv(bin, const_cast<char *const *>(argv.data()));
+      _exit(127);
+    }
+    close(pipefd[1]);
+    char buf[256];
+    ssize_t n;
+    while ((n = read(pipefd[0], buf, sizeof(buf))) > 0) out->append(buf, n);
+    close(pipefd[0]);
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) return -1;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+  };
+
+  std::string upstream_routes;
+  std::vector<const char *> ip_show_argv = {ip_bin, "route", "show",
+                                            "table", "all", "default"};
+  if (run_capture_text(ip_bin, ip_show_argv, &upstream_routes) != 0 ||
+      upstream_routes.empty()) {
+    log_line("scene-netnsctl: [veth-host] no default route discovered; "
+             "outbound forward will fail");
+    _exit(13);
+  }
+
+  // Parse the first non-empty line: "default via <gw> dev <oif> ..."
+  std::string upstream_gw, upstream_oif;
+  {
+    size_t pos = 0;
+    while (pos < upstream_routes.size()) {
+      size_t eol = upstream_routes.find('\n', pos);
+      if (eol == std::string::npos) eol = upstream_routes.size();
+      std::string line = upstream_routes.substr(pos, eol - pos);
+      pos = eol + 1;
+      // Tokenize.
+      std::vector<std::string> toks;
+      size_t i = 0;
+      while (i < line.size()) {
+        while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) ++i;
+        size_t start = i;
+        while (i < line.size() && line[i] != ' ' && line[i] != '\t') ++i;
+        if (start < i) toks.push_back(line.substr(start, i - start));
+      }
+      if (toks.size() >= 5 && toks[0] == "default" && toks[1] == "via" &&
+          toks[3] == "dev") {
+        upstream_gw = toks[2];
+        upstream_oif = toks[4];
+        break;
+      }
+    }
+  }
+  if (upstream_gw.empty() || upstream_oif.empty()) {
+    log_line("scene-netnsctl: [veth-host] could not parse default route from: %s",
+             upstream_routes.c_str());
+    _exit(14);
+  }
+  log_line("scene-netnsctl: [veth-host] upstream gw=%s oif=%s",
+           upstream_gw.c_str(), upstream_oif.c_str());
+
+  // Pre-clean any stale entries we may have left from a previous run.
+  Cmd c_rule_del = {ip_bin, "rule", "del", "iif", kVethHost,
+                    "table", "99"};
+  for (int i = 0; i < 4; ++i) {
+    if (run_capture(ip_bin, c_rule_del.argv(), "veth-host-cleanup") != 0) break;
+  }
+  Cmd c_table_flush = {ip_bin, "route", "flush", "table", "99"};
+  run_capture(ip_bin, c_table_flush.argv(), "veth-host-cleanup");
+
+  // Build table 99 with default + the scn-h connected route.
+  Cmd c_route_dflt = {ip_bin, "route", "add", "default",
+                      "via", upstream_gw.c_str(),
+                      "dev", upstream_oif.c_str(),
+                      "table", "99"};
+  if (run_capture(ip_bin, c_route_dflt.argv(), "veth-host") != 0) _exit(15);
+
+  Cmd c_route_link = {ip_bin, "route", "add", kVethNetCidr,
+                      "dev", kVethHost, "table", "99"};
+  if (run_capture(ip_bin, c_route_link.argv(), "veth-host") != 0) _exit(16);
+
+  // Steer traffic that arrives via scn-h into table 99.
+  Cmd c_rule_add = {ip_bin, "rule", "add", "iif", kVethHost,
+                    "pref", "11000", "table", "99"};
+  if (run_capture(ip_bin, c_rule_add.argv(), "veth-host") != 0) _exit(17);
+
   log_line("scene-netnsctl: [veth-host] host side ready (%s on %s, MASQ for %s)",
            kVethHostCidr, kVethHost, kVethNetCidr);
   _exit(0);
