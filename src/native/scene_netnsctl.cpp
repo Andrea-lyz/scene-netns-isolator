@@ -669,6 +669,49 @@ bool write_proc_file(const char *path, const char *value) {
     _exit(14);
   }
 
+  // Many OEM netd implementations install transient defaults during a
+  // network handover: a fresh `default via X dev rmnet_dataN` shows up via
+  // RTNETLINK, but rmnet_dataN's own per-network table is still empty and
+  // the interface itself will be replaced moments later.  Selecting an
+  // upstream whose dedicated table is empty means we'll latch onto a
+  // ghost interface and stay broken until the next event.
+  //
+  // Verify that the chosen oif has its own table populated with a default
+  // (this is what netd does for "real" upstreams).  If the table is empty
+  // the upstream is not yet stable; return 14 so the watchdog re-runs us
+  // a moment later and we can pick the next event's value.
+  {
+    std::string oif_default;
+    int pipefd[2];
+    if (pipe(pipefd) == 0) {
+      pid_t p = fork();
+      if (p == 0) {
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[0]);
+        close(pipefd[1]);
+        const char *argv[] = {ip_bin, "route", "show", "table",
+                              upstream_oif.c_str(), "default", nullptr};
+        execv(ip_bin, const_cast<char *const *>(argv));
+        _exit(127);
+      }
+      close(pipefd[1]);
+      char buf[256];
+      ssize_t n;
+      while ((n = read(pipefd[0], buf, sizeof(buf))) > 0)
+        oif_default.append(buf, n);
+      close(pipefd[0]);
+      int st = 0;
+      waitpid(p, &st, 0);
+    }
+    if (oif_default.find("default") == std::string::npos) {
+      log_line("scene-netnsctl: [route-refresh] %s table empty; treating as "
+               "unstable and waiting for next event",
+               upstream_oif.c_str());
+      _exit(14);
+    }
+  }
+
   // Read previously-applied upstream from cache, skip if unchanged so we
   // don't churn the routing table on every poll.
   char prev[256] = {};
@@ -826,17 +869,27 @@ void *routing_watchdog(void *) {
     }
     if (n == 0) continue;
 
-    // Coalesce bursts: drain anything else already queued, then sleep a
-    // tiny bit so a wifi-up event that arrives as a flurry of NEWROUTE
-    // messages collapses into a single refresh.  Refresh itself does fork
-    // + ip + iptables, which takes ~100ms; we don't want to do that twenty
-    // times in a row.
+    // ColorOS / netd installs transient defaults during cellular handover
+    // before the real one stabilises.  A fresh RTM_NEWROUTE for
+    // "default via X dev rmnet_dataN" can fire while netd is still
+    // building rmnet_dataN's per-network table, the interface name
+    // itself can be replaced 200ms later, and so on.  Wait a beat for
+    // the dust to settle, then drain everything that piled up so we
+    // collapse the entire reconfiguration burst into a single refresh.
+    sleep(1);
     pollfd pfd {nl, POLLIN, 0};
     while (poll(&pfd, 1, 250) > 0) {
       if (recv(nl, buf, sizeof(buf), 0) <= 0) break;
     }
 
-    refresh_routing_once();
+    // If the first refresh sees an unstable upstream (its own table is
+    // empty), back off and try a few more times.  This recovers from
+    // the wifi-off -> cellular-on transition where ConnectivityService
+    // takes 5-10 seconds to publish the final default.
+    for (int retry = 0; retry < 8; ++retry) {
+      if (refresh_routing_once()) break;
+      sleep(2);
+    }
   }
   return nullptr;
 }
