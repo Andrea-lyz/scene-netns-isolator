@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - 'v*'
   workflow_dispatch:
 
 permissions:
@@ -30,12 +32,25 @@ jobs:
         shell: bash
         run: bash scripts/build-native.sh
 
-      - name: Set package name
+      - name: Resolve release identity
         shell: bash
         run: |
-          build_time="$(TZ=Asia/Shanghai date +'%Y%m%d-%H%M%S')"
-          echo "BUILD_TIME=${build_time}" >> "$GITHUB_ENV"
-          echo "ZIP_NAME=scene-netns-isolator-${build_time}.zip" >> "$GITHUB_ENV"
+          # If we were triggered by a tag push, use the tag name verbatim.
+          # Otherwise produce a timestamped pre-release identifier.
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            tag="${GITHUB_REF#refs/tags/}"
+            kind="tag"
+            prerelease="false"
+          else
+            ts="$(TZ=Asia/Shanghai date +'%Y%m%d-%H%M%S')"
+            tag="nightly-${ts}"
+            kind="nightly"
+            prerelease="true"
+          fi
+          echo "RELEASE_TAG=${tag}" >> "$GITHUB_ENV"
+          echo "RELEASE_KIND=${kind}" >> "$GITHUB_ENV"
+          echo "RELEASE_PRERELEASE=${prerelease}" >> "$GITHUB_ENV"
+          echo "ZIP_NAME=scene-netns-isolator-${tag}.zip" >> "$GITHUB_ENV"
 
       - name: Package module zip
         shell: bash
@@ -49,8 +64,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          tag="v0.1.0-${BUILD_TIME}"
-          gh release create "${tag}" "${ZIP_NAME}" \
-            --title "Scene Netns Isolator v0.1.0 (${BUILD_TIME} GMT+8)" \
-            --notes "Automated release from ${GITHUB_SHA}." \
-            --latest=false
+          if [[ "${RELEASE_KIND}" == "tag" ]]; then
+            # The tag already exists in the repo (it's what triggered us).
+            # Some tag pushes can race ahead of the API view, so use --target
+            # to nail down the exact commit we're building from.
+            gh release create "${RELEASE_TAG}" "${ZIP_NAME}" \
+              --title "Scene Netns Isolator ${RELEASE_TAG}" \
+              --notes "Automated release from ${GITHUB_SHA}." \
+              --target "${GITHUB_SHA}" \
+              || gh release upload "${RELEASE_TAG}" "${ZIP_NAME}" --clobber
+          else
+            gh release create "${RELEASE_TAG}" "${ZIP_NAME}" \
+              --title "Scene Netns Isolator nightly ${RELEASE_TAG#nightly-}" \
+              --notes "Automated nightly build from ${GITHUB_SHA}." \
+              --prerelease \
+              --latest=false
+          fi
